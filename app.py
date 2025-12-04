@@ -19,8 +19,8 @@ GAUGE_M = 1.676              # meters (Indian broad gauge)
 PERMITTED_CANT_MM = 165.0
 WARNING_RATIO = 0.8
 
-st.set_page_config(layout="wide", page_title="Rail Tilt Monitor (no GPS)")
-st.title("Rail Tilt Monitor — Live (Tilt degrees, 4 sensors) — GPS removed")
+st.set_page_config(layout="wide", page_title="Rail Tilt Monitor ")
+st.title("Rail Tilt Monitor — Live (Tilt degrees, 4 sensors)")
 
 # auto-refresh
 st_autorefresh(interval=READ_REFRESH_MS, limit=0, key="autorefresh")
