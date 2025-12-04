@@ -1,6 +1,6 @@
 # app.py
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -10,140 +10,135 @@ import folium
 st.set_page_config(layout="wide", page_title="Rail Cant Monitor — CSV-backed (Live)")
 
 # ---------------------
-# CONFIG (edit if you want)
+# CONFIG
 # ---------------------
-CSV_URL_DEFAULT = ""  # default published CSV URL (leave blank and paste in sidebar)
-MAP_CACHE_TTL = 300  # seconds to cache the folium map (reduce flashing)
-CSV_CACHE_TTL = 600  # seconds to cache CSV loads
-TELEMETRY_POLL_SEC = 2  # seconds between telemetry updates (if you enable autorefresh)
-SIMULATE_GPS_DEFAULT = True  # simulate GPS if lat/lng are missing
+CSV_URL_DEFAULT = ""
+MAP_CACHE_TTL = 300       # seconds to cache the folium map
+CSV_CACHE_TTL = 600       # cache CSV loads
+TELEMETRY_POLL_SEC = 2    # used for wording only (autorefresh commented)
+SIMULATE_GPS_DEFAULT = True
+USE_NOW_AS_LATEST_DEFAULT = True
 
-# Delhi & Jaipur coords (approx)
-DELHI = (28.6139, 77.2090)
-JAIPUR = (26.9124, 75.7873)
+# Approximate railway route station coords (Delhi -> Jaipur). These are station-like anchors,
+# used to create a railway-like interpolated path if CSV lacks real GPS.
+RAILWAY_STATIONS = [
+    (28.6406, 77.2195),  # New Delhi area
+    (28.1970, 76.6166),  # Rewari-ish
+    (27.8866, 76.6061),  # Alwar-ish outskirts
+    (27.0238, 76.3932),  # near Bandikui / Dausa-ish
+    (26.9124, 75.7873),  # Jaipur
+]
 
 # ---------------------
-# Helper functions
+# HELPERS
 # ---------------------
 @st.cache_data(ttl=CSV_CACHE_TTL)
 def load_csv(csv_url: str):
     """Load CSV from URL (cached). Returns dataframe or raises."""
     if not csv_url:
         return None
-    try:
-        df = pd.read_csv(csv_url)
-        # strip whitespace from columns
-        df.columns = [c.strip() for c in df.columns]
-        return df
-    except Exception as e:
-        # bubble up error to UI
-        raise RuntimeError(f"Error loading CSV: {e}")
+    df = pd.read_csv(csv_url)
+    df.columns = [c.strip() for c in df.columns]
+    return df
 
 def detect_timestamp_column(df: pd.DataFrame):
-    """Return the name of a timestamp-like column if found, else None."""
     if df is None or df.empty:
         return None
     candidates = [c for c in df.columns if c.lower() in ("timestamp", "time", "ts", "datetime", "created", "date")]
     if candidates:
         return candidates[0]
-    # fallback: look for columns containing 'time' or 'date'
     for c in df.columns:
         if "time" in c.lower() or "date" in c.lower():
             return c
     return None
 
-def ensure_timestamp(df: pd.DataFrame):
-    """
-    Ensure df has a usable timestamp column.
-    Returns (df, ts_col_name).
-    If no timestamp exists, creates a synthetic 'timestamp' column using monotonic recent times.
-    """
-    if df is None:
-        return df, None
-
-    df = df.copy()
-    ts_col = detect_timestamp_column(df)
-    if ts_col:
-        # try to parse, coerce invalids to NaT
-        df[ts_col] = pd.to_datetime(df[ts_col], errors="coerce")
-        # if all values are NaT, treat as no timestamp
-        if df[ts_col].isna().all():
-            ts_col = None
-        else:
-            # sort by timestamp to make sure latest is last
-            df = df.sort_values(ts_col).reset_index(drop=True)
-            return df, ts_col
-
-    # No usable timestamp found -> generate synthetic timestamps
-    n = len(df)
-    if n == 0:
-        return df, None
-    start = pd.Timestamp.now()
-    # create timestamps separated by 1 second (deterministic for a run)
-    synthetic_ts = [start + pd.Timedelta(seconds=i) for i in range(n)]
-    df["timestamp"] = synthetic_ts
-    df = df.reset_index(drop=True)
-    return df, "timestamp"
-
 def detect_cant_column(df: pd.DataFrame):
-    """Detect a column that likely holds the 'cant' telemetry value."""
     if df is None or df.empty:
         return None
-    # common names
     for name in df.columns:
-        if name.lower() in ("cant", "cant_mm", "cant (mm)", "cant_mm "):
+        if name.lower() in ("cant", "cant_mm", "cant (mm)"):
             return name
-    # fuzzy: column name contains 'cant' or 'inclination' or 'value'
     for name in df.columns:
         if "cant" in name.lower() or "inclination" in name.lower() or "value" in name.lower():
             return name
-    # fallback: return the last numeric column
     numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
     if numeric_cols:
         return numeric_cols[-1]
     return None
 
-def simulate_gps_along(n_points, start=DELHI, end=JAIPUR):
-    """Return lat/lon arrays linearly interpolated between two points (inclusive)."""
+def interpolate_along_stations(n_points, stations):
+    """Interpolate n_points along the polyline formed by stations (keeps order)."""
     if n_points <= 0:
-        return [], []
-    lats = np.linspace(start[0], end[0], n_points)
-    lons = np.linspace(start[1], end[1], n_points)
-    return lats, lons
+        return []
+    # compute segment lengths and distribute points proportionally across segments
+    segs = list(zip(stations[:-1], stations[1:]))
+    seg_lengths = []
+    for (a, b) in segs:
+        seg_lengths.append(((a[0]-b[0])**2 + (a[1]-b[1])**2)**0.5)
+    total = sum(seg_lengths)
+    coords = []
+    if total == 0:
+        # degenerate -> repeat single point
+        coords = [stations[0]] * n_points
+        return coords
+    # allocate integer counts per segment
+    allocated = []
+    for L in seg_lengths:
+        allocated.append(max(1, int(round(n_points * (L / total)))))
+    # adjust allocated to sum exactly n_points
+    diff = sum(allocated) - n_points
+    i = 0
+    while diff != 0:
+        if diff > 0:
+            # remove one from segments with allocated>1
+            if allocated[i] > 1:
+                allocated[i] -= 1
+                diff -= 1
+        else:
+            allocated[i] += 1
+            diff += 1
+        i = (i + 1) % len(allocated)
+    # now interpolate per-segment
+    for idx, ((lat1, lon1), (lat2, lon2)) in enumerate(segs):
+        count = allocated[idx]
+        for k in range(count):
+            t = k / max(1, count - 1) if count > 1 else 0
+            lat = lat1 + (lat2 - lat1) * t
+            lon = lon1 + (lon2 - lon1) * t
+            coords.append((lat, lon))
+    # if we overshot or undershot, trim or pad
+    if len(coords) > n_points:
+        coords = coords[:n_points]
+    while len(coords) < n_points:
+        coords.append(stations[-1])
+    return coords
 
 @st.cache_data(ttl=MAP_CACHE_TTL)
 def build_map(track_coords, center=None, zoom_start=7):
-    """
-    Build a folium.Map containing the track polyline and start/end markers.
-    This function is cached to reduce rebuilds and flashing.
-    """
     if center is None:
-        center = track_coords[len(track_coords)//2] if track_coords else DELHI
+        center = track_coords[len(track_coords)//2] if track_coords else RAILWAY_STATIONS[0]
     m = folium.Map(location=center, zoom_start=zoom_start)
-    if track_coords and len(track_coords) > 0:
-        folium.PolyLine(track_coords, weight=4, opacity=0.8).add_to(m)
+    if track_coords:
+        folium.PolyLine(track_coords, weight=4, opacity=0.85).add_to(m)
         folium.CircleMarker(track_coords[0], radius=6, popup="start", tooltip="start").add_to(m)
         folium.CircleMarker(track_coords[-1], radius=6, popup="end", tooltip="end").add_to(m)
     return m
 
 # ---------------------
-# Sidebar: user inputs
+# UI: Sidebar
 # ---------------------
 st.sidebar.header("Configuration")
-csv_url = st.sidebar.text_input("Published CSV URL (leave blank to use CSV_URL secret)", CSV_URL_DEFAULT)
-simulate_gps_checkbox = st.sidebar.checkbox("Simulate GPS along Delhi→Jaipur (if no lat/lng)", value=SIMULATE_GPS_DEFAULT)
-st.sidebar.markdown(f"Map refresh: cached every {MAP_CACHE_TTL//60} minutes to avoid flashing")
-st.sidebar.markdown(f"Telemetry poll: every {TELEMETRY_POLL_SEC} seconds")
-
-# Optional: autorefresh. Uncomment to enable automatic polls (the app will rerun periodically).
-# from streamlit_autorefresh import st_autorefresh
-# st_autorefresh(interval=TELEMETRY_POLL_SEC * 1000, key="auto_refresh")
+csv_url = st.sidebar.text_input("Published CSV URL (leave blank to use secret)", CSV_URL_DEFAULT)
+simulate_gps_checkbox = st.sidebar.checkbox("Simulate GPS along railway (if no lat/lng)", value=SIMULATE_GPS_DEFAULT)
+use_now_as_latest = st.sidebar.checkbox("Treat latest row timestamp as RIGHT NOW (override)", value=USE_NOW_AS_LATEST_DEFAULT)
+st.sidebar.markdown(f"Map cached for {MAP_CACHE_TTL//60} minutes to avoid flashing.")
+st.sidebar.markdown("Raw preview is hidden by default — expand 'Raw CSV / Debug' to view it.")
 
 # ---------------------
 # Load CSV (cached)
 # ---------------------
-df = None
 load_error = None
+df = None
 try:
     df = load_csv(csv_url) if csv_url else None
 except Exception as e:
@@ -152,129 +147,139 @@ except Exception as e:
 if load_error:
     st.sidebar.error(load_error)
 
-# If no CSV, create empty df to avoid many checks later
 if df is None:
     df = pd.DataFrame()
 
-# ---------------------
-# Normalize columns and ensure timestamp
-# ---------------------
-# Trim column names and remove pesky newlines
+# Normalize column names whitespace
 df.columns = [c.strip() for c in df.columns]
 
-df, ts_col = ensure_timestamp(df)
+# ---------------------
+# TIMESTAMP handling: force latest = now if requested, otherwise detect or synthesize
+# ---------------------
+ts_col = detect_timestamp_column(df)
+if ts_col:
+    df[ts_col] = pd.to_datetime(df[ts_col], errors="coerce")
+    # if all invalid, treat as missing
+    if df[ts_col].isna().all():
+        ts_col = None
+    else:
+        df = df.sort_values(ts_col).reset_index(drop=True)
+
+# If no timestamp column or user wants now-as-latest override
+if ts_col is None or use_now_as_latest:
+    n = len(df)
+    if n > 0:
+        # create synthetic timestamps such that the last row = now (current time)
+        now = pd.Timestamp.now()
+        # assign timestamps spaced 1 second apart ending at now
+        synthetic = [now - pd.Timedelta(seconds=(n - 1 - i)) for i in range(n)]
+        df = df.copy()
+        df["timestamp"] = synthetic
+        ts_col = "timestamp"
+    else:
+        ts_col = None
 
 # ---------------------
-# Ensure cant column detection
+# CANT detection and formatting
 # ---------------------
 cant_col = detect_cant_column(df)
 if cant_col:
-    # coerce to numeric if possible
     df[cant_col] = pd.to_numeric(df[cant_col], errors="coerce")
 
 # ---------------------
-# Ensure lat/lng exist (simulate if missing)
+# GPS / TRACK handling
 # ---------------------
-has_latlng = ("lat" in df.columns and "lng" in df.columns) or ("latitude" in df.columns and "longitude" in df.columns)
-# normalize names
+# normalize lat/lng names
 if "latitude" in df.columns and "longitude" in df.columns and not ("lat" in df.columns and "lng" in df.columns):
     df = df.rename(columns={"latitude": "lat", "longitude": "lng"})
 
-if (not has_latlng) and simulate_gps_checkbox and len(df) > 0:
-    lats, lons = simulate_gps_along(len(df), start=DELHI, end=JAIPUR)
-    df = df.copy()
-    df["lat"] = lats
-    df["lng"] = lons
+has_latlng = ("lat" in df.columns and "lng" in df.columns)
 
-# Build track coords if available
-if "lat" in df.columns and "lng" in df.columns and len(df) > 0:
-    coords = list(zip(df["lat"].astype(float).tolist(), df["lng"].astype(float).tolist()))
+if not has_latlng and simulate_gps_checkbox and len(df) > 0:
+    # Make a railway-like track by interpolating between RAILWAY_STATIONS
+    coords = interpolate_along_stations(len(df), RAILWAY_STATIONS)
+    df = df.copy()
+    df["lat"] = [c[0] for c in coords]
+    df["lng"] = [c[1] for c in coords]
 else:
-    coords = []
+    if "lat" in df.columns and "lng" in df.columns and len(df) > 0:
+        coords = list(zip(df["lat"].astype(float).tolist(), df["lng"].astype(float).tolist()))
+    else:
+        coords = []
 
 # ---------------------
-# Layout: left = telemetry, middle = map, right = debug/data
+# LAYOUT
 # ---------------------
 left_col, mid_col, right_col = st.columns([1.0, 2.0, 1.2])
 
 with left_col:
     st.title("Live telemetry")
-    # placeholders so we only update these small widgets on rerun
     ts_placeholder = st.empty()
-    channel_placeholder = st.empty()
+    chan_placeholder = st.empty()
     val_placeholder = st.empty()
     status_placeholder = st.empty()
     st.markdown("---")
-    st.write(f"Telemetry poll: every {TELEMETRY_POLL_SEC} s (autorefresh disabled by default)")
+    st.write(f"Polling interval: {TELEMETRY_POLL_SEC}s (autorefresh disabled by default)")
 
 with mid_col:
     st.title("Map")
-    map_placeholder = st.empty()
+    # render map inside the middle column — calling st_folium here will render map (we don't display returned dict)
+    folium_map = build_map(coords, center=coords[len(coords)//2] if coords else RAILWAY_STATIONS[0], zoom_start=7)
+    st_folium(folium_map, width="100%", height=520)
 
 with right_col:
-    st.title("Raw / preview")
-    st.dataframe(df.tail(10), use_container_width=True)
+    st.title("Controls")
+    st.markdown("Use the sidebar to change CSV URL, enable GPS simulation, or toggle timestamp override.")
+    with st.expander("Raw CSV / Debug", expanded=False):
+        st.dataframe(df.head(200), use_container_width=True)
 
 # ---------------------
-# Build & display cached map once per cache TTL
-# ---------------------
-folium_map = build_map(coords, center=coords[len(coords)//2] if coords else DELHI, zoom_start=7)
-# st_folium returns an object but writing it via placeholder avoids rebuilding map code block in layout
-map_placeholder.write(st_folium(folium_map, width="100%", height=480))
-
-# ---------------------
-# Telemetry display logic (lightweight)
+# TELEMETRY DISPLAY (friendly)
 # ---------------------
 if len(df) > 0:
     latest_row = df.iloc[-1]
-    # timestamp
+    # timestamp formatting
     if ts_col and ts_col in latest_row and pd.notna(latest_row[ts_col]):
-        ts_value = latest_row[ts_col]
-        # display as nice formatted string
-        if isinstance(ts_value, (pd.Timestamp, datetime)):
-            ts_str = pd.to_datetime(ts_value).strftime("%Y-%m-%d %H:%M:%S")
-        else:
-            ts_str = str(ts_value)
+        ts_val = pd.to_datetime(latest_row[ts_col])
+        ts_str = ts_val.strftime("%Y-%m-%d %H:%M:%S")
     else:
         ts_str = "—"
 
-    # channel (if available)
+    # channel
     channel_val = latest_row.get("channel", latest_row.get("Channel", "—"))
 
-    # telemetry value (cant)
-    latest_val = latest_row.get(cant_col, "—") if cant_col else "—"
+    # cant value
+    if cant_col:
+        latest_val_raw = latest_row.get(cant_col, None)
+        try:
+            latest_val = float(latest_val_raw)
+            latest_val_str = f"{latest_val:.2f}"
+        except Exception:
+            latest_val = None
+            latest_val_str = "—"
+    else:
+        latest_val = None
+        latest_val_str = "—"
 
     ts_placeholder.markdown(f"**Timestamp:** {ts_str}")
-    channel_placeholder.markdown(f"**Channel:** {channel_val}")
-    val_placeholder.markdown(f"**Cant (mm)**\n\n### {latest_val}")
-    # status logic: example thresholds (customize)
-    try:
-        numeric_val = float(latest_val)
-        if np.isnan(numeric_val):
-            status = "NO DATA"
-            status_emoji = "⚪"
-        elif numeric_val < 50:
-            status = "GREEN"
-            status_emoji = "🟢"
-        elif numeric_val < 100:
-            status = "AMBER"
-            status_emoji = "🟠"
-        else:
-            status = "RED"
-            status_emoji = "🔴"
-    except Exception:
-        status = "UNKNOWN"
-        status_emoji = "⚪"
+    chan_placeholder.markdown(f"**Channel:** {channel_val}")
+    val_placeholder.markdown(f"**Cant (mm)**\n\n### {latest_val_str}")
 
-    status_placeholder.markdown(f"**Status:** {status_emoji} {status}")
+    # status logic with clear labels
+    if latest_val is None or np.isnan(latest_val):
+        status_placeholder.markdown("**Status:** ⚪ NO DATA")
+    else:
+        if latest_val < 50:
+            status_placeholder.markdown("**Status:** 🟢 GREEN")
+        elif latest_val < 100:
+            status_placeholder.markdown("**Status:** 🟠 AMBER")
+        else:
+            status_placeholder.markdown("**Status:** 🔴 RED")
 else:
     ts_placeholder.markdown("**Timestamp:** —")
-    channel_placeholder.markdown("**Channel:** —")
+    chan_placeholder.markdown("**Channel:** —")
     val_placeholder.markdown("**Cant (mm)**\n\n### —")
     status_placeholder.markdown("**Status:** ⚪ NO DATA")
 
-# ---------------------
-# Footer / tips
-# ---------------------
 st.markdown("---")
-st.caption("Map is cached for MAP_CACHE_TTL seconds to reduce flashing. To force a fresh map, restart the app or change the URL.")
+st.caption("Map is cached for a short time to prevent flashing. To force a fresh map, restart the app or change the CSV URL.")
