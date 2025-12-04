@@ -22,7 +22,7 @@ GAUGE_M = 1.676
 OVERPASS_TIMEOUT = 15
 
 st.set_page_config(layout="wide", page_title="Rail Cant Monitor (AppsScript /exec)", initial_sidebar_state="collapsed")
-st.title("Rail Cant Monitor — using your Apps Script /exec (live)")
+st.title("Rail Cant Monitor")
 
 # small auto refresh
 st_autorefresh(interval=READ_REFRESH_MS, limit=0, key="autorefresh")
