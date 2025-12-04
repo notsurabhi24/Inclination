@@ -16,7 +16,7 @@ WARNING_RATIO = 0.8
 GAUGE_M = 1.676
 
 st.set_page_config(layout="wide", page_title="Rail Cant Monitor — Safe Minimal")
-st.title("Rail Cant Monitor — Safe Minimal")
+st.title("Rail Cant Monitor")
 
 # auto-refresh every READ_REFRESH_MS ms
 st_autorefresh(interval=READ_REFRESH_MS, limit=0, key="autorefresh")
