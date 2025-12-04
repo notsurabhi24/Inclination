@@ -8,4 +8,5 @@ streamlit-autorefresh
 pytz
 streamlit-folium
 folium
+matplotlib
 
