@@ -1,285 +1,356 @@
 # app.py
-import time
-from datetime import datetime, timedelta
-import numpy as np
-import pandas as pd
 import streamlit as st
-from streamlit_folium import st_folium
-import folium
+import pandas as pd
+import numpy as np
+import pydeck as pdk
+import matplotlib.pyplot as plt
+import time
+import math
+import os
+from datetime import datetime
+from math import radians, asin, sqrt, sin, cos
 
-st.set_page_config(layout="wide", page_title="Rail Cant Monitor — CSV-backed (Live)")
+st.set_page_config(layout="wide", page_title="MPU + Train Simulator — Tilt Visuals")
 
-# ---------------------
-# CONFIG
-# ---------------------
-CSV_URL_DEFAULT = ""
-MAP_CACHE_TTL = 300       # seconds to cache the folium map
-CSV_CACHE_TTL = 600       # cache CSV loads
-TELEMETRY_POLL_SEC = 2    # used for wording only (autorefresh commented)
-SIMULATE_GPS_DEFAULT = True
-USE_NOW_AS_LATEST_DEFAULT = True
-
-# Approximate railway route station coords (Delhi -> Jaipur). These are station-like anchors,
-# used to create a railway-like interpolated path if CSV lacks real GPS.
-RAILWAY_STATIONS = [
-    (28.6406, 77.2195),  # New Delhi area
-    (28.1970, 76.6166),  # Rewari-ish
-    (27.8866, 76.6061),  # Alwar-ish outskirts
-    (27.0238, 76.3932),  # near Bandikui / Dausa-ish
-    (26.9124, 75.7873),  # Jaipur
+# -------------------------
+# Config & route (edit here)
+# -------------------------
+CSV_FILENAME = "mpu_simulated.csv"  # local CSV the simulator writes (or upload your own)
+ROUTE_STATIONS = [
+    ("Mumbai CSMT", 18.939821, 72.835468),
+    ("Dadar",       19.0180,    72.8481),
+    ("Thane",       19.18611,   72.97583),
+    ("Kalyan",      19.2437,    73.13554),
+    ("Lonavala",    18.74806,   73.40722),
+    ("Pune Junction",18.5289,   73.8743)
 ]
+MAX_TILT_DISPLAY = st.sidebar.slider("Max tilt shown (°)", 20, 90, 45)
 
-# ---------------------
-# HELPERS
-# ---------------------
-@st.cache_data(ttl=CSV_CACHE_TTL)
-def load_csv(csv_url: str):
-    """Load CSV from URL (cached). Returns dataframe or raises."""
-    if not csv_url:
-        return None
-    df = pd.read_csv(csv_url)
-    df.columns = [c.strip() for c in df.columns]
-    return df
+# -------------------------
+# Utilities
+# -------------------------
+def haversine(lat1, lon1, lat2, lon2):
+    R = 6371.0
+    dlat = radians(lat2 - lat1)
+    dlon = radians(lon2 - lon1)
+    a = sin(dlat/2)**2 + cos(radians(lat1))*cos(radians(lat2))*sin(dlon/2)**2
+    c = 2 * asin(sqrt(a))
+    return R * c
 
-def detect_timestamp_column(df: pd.DataFrame):
-    if df is None or df.empty:
-        return None
-    candidates = [c for c in df.columns if c.lower() in ("timestamp", "time", "ts", "datetime", "created", "date")]
-    if candidates:
-        return candidates[0]
-    for c in df.columns:
-        if "time" in c.lower() or "date" in c.lower():
-            return c
-    return None
+def segment_lengths(coords):
+    return [haversine(coords[i][0], coords[i][1], coords[i+1][0], coords[i+1][1]) for i in range(len(coords)-1)]
 
-def detect_cant_column(df: pd.DataFrame):
-    if df is None or df.empty:
-        return None
-    for name in df.columns:
-        if name.lower() in ("cant", "cant_mm", "cant (mm)"):
-            return name
-    for name in df.columns:
-        if "cant" in name.lower() or "inclination" in name.lower() or "value" in name.lower():
-            return name
-    numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
-    if numeric_cols:
-        return numeric_cols[-1]
-    return None
-
-def interpolate_along_stations(n_points, stations):
-    """Interpolate n_points along the polyline formed by stations (keeps order)."""
-    if n_points <= 0:
-        return []
-    # compute segment lengths and distribute points proportionally across segments
-    segs = list(zip(stations[:-1], stations[1:]))
-    seg_lengths = []
-    for (a, b) in segs:
-        seg_lengths.append(((a[0]-b[0])**2 + (a[1]-b[1])**2)**0.5)
-    total = sum(seg_lengths)
-    coords = []
+def interpolate_point_along_polyline(poly_coords, frac):
+    if frac <= 0:
+        return poly_coords[0]
+    if frac >= 1:
+        return poly_coords[-1]
+    seg_dists = segment_lengths(poly_coords)
+    total = sum(seg_dists)
     if total == 0:
-        # degenerate -> repeat single point
-        coords = [stations[0]] * n_points
-        return coords
-    # allocate integer counts per segment
-    allocated = []
-    for L in seg_lengths:
-        allocated.append(max(1, int(round(n_points * (L / total)))))
-    # adjust allocated to sum exactly n_points
-    diff = sum(allocated) - n_points
-    i = 0
-    while diff != 0:
-        if diff > 0:
-            # remove one from segments with allocated>1
-            if allocated[i] > 1:
-                allocated[i] -= 1
-                diff -= 1
-        else:
-            allocated[i] += 1
-            diff += 1
-        i = (i + 1) % len(allocated)
-    # now interpolate per-segment
-    for idx, ((lat1, lon1), (lat2, lon2)) in enumerate(segs):
-        count = allocated[idx]
-        for k in range(count):
-            t = k / max(1, count - 1) if count > 1 else 0
-            lat = lat1 + (lat2 - lat1) * t
-            lon = lon1 + (lon2 - lon1) * t
-            coords.append((lat, lon))
-    # if we overshot or undershot, trim or pad
-    if len(coords) > n_points:
-        coords = coords[:n_points]
-    while len(coords) < n_points:
-        coords.append(stations[-1])
-    return coords
+        return poly_coords[0]
+    target = frac * total
+    cum = 0.0
+    for i, sd in enumerate(seg_dists):
+        if cum + sd >= target:
+            rem = target - cum
+            ratio = rem / sd if sd != 0 else 0
+            lat1, lon1 = poly_coords[i]
+            lat2, lon2 = poly_coords[i+1]
+            lat = lat1 + (lat2 - lat1) * ratio
+            lon = lon1 + (lon2 - lon1) * ratio
+            return (lat, lon)
+        cum += sd
+    return poly_coords[-1]
 
-@st.cache_data(ttl=MAP_CACHE_TTL)
-def build_map(track_coords, center=None, zoom_start=7):
-    if center is None:
-        center = track_coords[len(track_coords)//2] if track_coords else RAILWAY_STATIONS[0]
-    m = folium.Map(location=center, zoom_start=zoom_start)
-    if track_coords:
-        folium.PolyLine(track_coords, weight=4, opacity=0.85).add_to(m)
-        folium.CircleMarker(track_coords[0], radius=6, popup="start", tooltip="start").add_to(m)
-        folium.CircleMarker(track_coords[-1], radius=6, popup="end", tooltip="end").add_to(m)
-    return m
+def compute_roll_pitch_from_acc(ax, ay, az):
+    # ax,ay,az are in g units
+    roll = math.degrees(math.atan2(ay, az))
+    denom = math.sqrt(ay*ay + az*az)
+    if denom == 0:
+        pitch = 0.0
+    else:
+        pitch = math.degrees(math.atan2(-ax, denom))
+    return round(roll, 2), round(pitch, 2)
 
-# ---------------------
-# UI: Sidebar
-# ---------------------
-st.sidebar.header("Configuration")
-csv_url = st.sidebar.text_input("Published CSV URL (leave blank to use secret)", CSV_URL_DEFAULT)
-simulate_gps_checkbox = st.sidebar.checkbox("Simulate GPS along railway (if no lat/lng)", value=SIMULATE_GPS_DEFAULT)
-use_now_as_latest = st.sidebar.checkbox("Treat latest row timestamp as RIGHT NOW (override)", value=USE_NOW_AS_LATEST_DEFAULT)
-st.sidebar.markdown(f"Map cached for {MAP_CACHE_TTL//60} minutes to avoid flashing.")
-st.sidebar.markdown("Raw preview is hidden by default — expand 'Raw CSV / Debug' to view it.")
+# -------------------------
+# Data loading
+# -------------------------
+st.title("MPU tilt visualizer + train GPS simulator")
+st.markdown("Upload your MPU spreadsheet (CSV/XLSX) or let the app read a local CSV named `mpu_simulated.csv`.")
 
-# ---------------------
-# Load CSV (cached)
-# ---------------------
-load_error = None
+uploaded = st.file_uploader("Upload CSV / Excel (optional)", type=["csv","xlsx","xls"])
+use_local_if_exists = st.checkbox("Read local CSV if available", value=True)
+
 df = None
-try:
-    df = load_csv(csv_url) if csv_url else None
-except Exception as e:
-    load_error = str(e)
-
-if load_error:
-    st.sidebar.error(load_error)
-
-if df is None:
-    df = pd.DataFrame()
-
-# Normalize column names whitespace
-df.columns = [c.strip() for c in df.columns]
-
-# ---------------------
-# TIMESTAMP handling: force latest = now if requested, otherwise detect or synthesize
-# ---------------------
-ts_col = detect_timestamp_column(df)
-if ts_col:
-    df[ts_col] = pd.to_datetime(df[ts_col], errors="coerce")
-    # if all invalid, treat as missing
-    if df[ts_col].isna().all():
-        ts_col = None
-    else:
-        df = df.sort_values(ts_col).reset_index(drop=True)
-
-# If no timestamp column or user wants now-as-latest override
-if ts_col is None or use_now_as_latest:
-    n = len(df)
-    if n > 0:
-        # create synthetic timestamps such that the last row = now (current time)
-        now = pd.Timestamp.now()
-        # assign timestamps spaced 1 second apart ending at now
-        synthetic = [now - pd.Timedelta(seconds=(n - 1 - i)) for i in range(n)]
-        df = df.copy()
-        df["timestamp"] = synthetic
-        ts_col = "timestamp"
-    else:
-        ts_col = None
-
-# ---------------------
-# CANT detection and formatting
-# ---------------------
-cant_col = detect_cant_column(df)
-if cant_col:
-    df[cant_col] = pd.to_numeric(df[cant_col], errors="coerce")
-
-# ---------------------
-# GPS / TRACK handling
-# ---------------------
-# normalize lat/lng names
-if "latitude" in df.columns and "longitude" in df.columns and not ("lat" in df.columns and "lng" in df.columns):
-    df = df.rename(columns={"latitude": "lat", "longitude": "lng"})
-
-has_latlng = ("lat" in df.columns and "lng" in df.columns)
-
-if not has_latlng and simulate_gps_checkbox and len(df) > 0:
-    # Make a railway-like track by interpolating between RAILWAY_STATIONS
-    coords = interpolate_along_stations(len(df), RAILWAY_STATIONS)
-    df = df.copy()
-    df["lat"] = [c[0] for c in coords]
-    df["lng"] = [c[1] for c in coords]
-else:
-    if "lat" in df.columns and "lng" in df.columns and len(df) > 0:
-        coords = list(zip(df["lat"].astype(float).tolist(), df["lng"].astype(float).tolist()))
-    else:
-        coords = []
-
-# ---------------------
-# LAYOUT
-# ---------------------
-left_col, mid_col, right_col = st.columns([1.0, 2.0, 1.2])
-
-with left_col:
-    st.title("Live telemetry")
-    ts_placeholder = st.empty()
-    chan_placeholder = st.empty()
-    val_placeholder = st.empty()
-    status_placeholder = st.empty()
-    st.markdown("---")
-    st.write(f"Polling interval: {TELEMETRY_POLL_SEC}s (autorefresh disabled by default)")
-
-with mid_col:
-    st.title("Map")
-    # render map inside the middle column — calling st_folium here will render map (we don't display returned dict)
-    folium_map = build_map(coords, center=coords[len(coords)//2] if coords else RAILWAY_STATIONS[0], zoom_start=7)
-    st_folium(folium_map, width="100%", height=520)
-
-with right_col:
-    st.title("Controls")
-    st.markdown("Use the sidebar to change CSV URL, enable GPS simulation, or toggle timestamp override.")
-    with st.expander("Raw CSV / Debug", expanded=False):
-        st.dataframe(df.head(200), use_container_width=True)
-
-# ---------------------
-# TELEMETRY DISPLAY (friendly)
-# ---------------------
-if len(df) > 0:
-    latest_row = df.iloc[-1]
-    # timestamp formatting
-    if ts_col and ts_col in latest_row and pd.notna(latest_row[ts_col]):
-        ts_val = pd.to_datetime(latest_row[ts_col])
-        ts_str = ts_val.strftime("%Y-%m-%d %H:%M:%S")
-    else:
-        ts_str = "—"
-
-    # channel
-    channel_val = latest_row.get("channel", latest_row.get("Channel", "—"))
-
-    # cant value
-    if cant_col:
-        latest_val_raw = latest_row.get(cant_col, None)
-        try:
-            latest_val = float(latest_val_raw)
-            latest_val_str = f"{latest_val:.2f}"
-        except Exception:
-            latest_val = None
-            latest_val_str = "—"
-    else:
-        latest_val = None
-        latest_val_str = "—"
-
-    ts_placeholder.markdown(f"**Timestamp:** {ts_str}")
-    chan_placeholder.markdown(f"**Channel:** {channel_val}")
-    val_placeholder.markdown(f"**Cant (mm)**\n\n### {latest_val_str}")
-
-    # status logic with clear labels
-    if latest_val is None or np.isnan(latest_val):
-        status_placeholder.markdown("**Status:** ⚪ NO DATA")
-    else:
-        if latest_val < 50:
-            status_placeholder.markdown("**Status:** 🟢 GREEN")
-        elif latest_val < 100:
-            status_placeholder.markdown("**Status:** 🟠 AMBER")
+if uploaded is not None:
+    try:
+        if uploaded.name.endswith(".csv"):
+            df = pd.read_csv(uploaded)
         else:
-            status_placeholder.markdown("**Status:** 🔴 RED")
+            df = pd.read_excel(uploaded)
+        st.success(f"Loaded upload: {uploaded.name}")
+    except Exception as e:
+        st.error(f"Failed to read uploaded file: {e}")
+        st.stop()
 else:
-    ts_placeholder.markdown("**Timestamp:** —")
-    chan_placeholder.markdown("**Channel:** —")
-    val_placeholder.markdown("**Cant (mm)**\n\n### —")
-    status_placeholder.markdown("**Status:** ⚪ NO DATA")
+    if use_local_if_exists and os.path.isfile(CSV_FILENAME):
+        try:
+            df = pd.read_csv(CSV_FILENAME)
+            st.success(f"Loaded local CSV: {CSV_FILENAME}")
+        except Exception as e:
+            st.error(f"Failed to read {CSV_FILENAME}: {e}")
+            st.stop()
+    else:
+        st.info("No file provided. Use 'Use example data' to try a demo.")
+        if st.button("Use example synthetic data"):
+            # build small example df
+            n = 120
+            t0 = datetime.now()
+            timestamps = [t0 + pd.Timedelta(seconds=10*i) for i in range(n)]
+            df = pd.DataFrame({
+                "timestamp": timestamps,
+                "tilt_x": np.sin(np.linspace(0, 6*np.pi, n)) * 0.4,
+                "tilt_y": np.cos(np.linspace(0, 4*np.pi, n)) * 0.3,
+                "tilt_z": 1.0 + np.random.normal(0,0.02,n),
+                "tilt_x1": np.random.normal(0,0.05,n),
+                "tilt_y1": np.random.normal(0,0.05,n),
+                "tilt_z1": 1.0 + np.random.normal(0,0.02,n),
+                "tilt_x2": np.random.normal(0,0.05,n),
+                "tilt_y2": np.random.normal(0,0.05,n),
+                "tilt_z2": 1.0 + np.random.normal(0,0.02,n),
+                "tilt_x3": np.random.normal(0,0.05,n),
+                "tilt_y3": np.random.normal(0,0.05,n),
+                "tilt_z3": 1.0 + np.random.normal(0,0.02,n),
+            })
+        else:
+            st.stop()
 
+# ensure timestamp column exists & parsed
+if df is None:
+    st.error("No data frame loaded.")
+    st.stop()
+
+if "timestamp" not in df.columns:
+    st.error("Data must have a 'timestamp' column.")
+    st.stop()
+
+df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
+if df['timestamp'].isna().any():
+    st.warning("Some timestamps failed to parse; dropping those rows.")
+    df = df.dropna(subset=['timestamp']).reset_index(drop=True)
+
+df = df.sort_values('timestamp').reset_index(drop=True)
+
+# make sure tilt columns exist (create zeros if missing)
+for ch in range(4):
+    base = "" if ch == 0 else str(ch)
+    for axis in ['x','y','z']:
+        col = f"tilt_{axis}{base}"
+        if col not in df.columns:
+            df[col] = 0.0
+
+# fill lat/lon by simulation if missing or all null
+poly_coords = [(lat, lon) for (_, lat, lon) in ROUTE_STATIONS]
+needs_fill = ('latitude' not in df.columns) or (df['latitude'].isna().all()) or ('longitude' not in df.columns) or (df['longitude'].isna().all())
+if needs_fill:
+    st.info("Filling missing latitude/longitude by linearly mapping timestamps across route polyline.")
+    t0 = df['timestamp'].iloc[0]
+    t_end = df['timestamp'].iloc[-1]
+    total_seconds = (t_end - t0).total_seconds() if (t_end != t0) else 1.0
+    lats, lons = [], []
+    for t in df['timestamp']:
+        frac = (t - t0).total_seconds() / total_seconds
+        lat, lon = interpolate_point_along_polyline(poly_coords, frac)
+        lats.append(lat)
+        lons.append(lon)
+    df['latitude'] = lats
+    df['longitude'] = lons
+else:
+    st.success("Using latitude/longitude from file.")
+
+# progress percent
+df['progress_pct'] = ((df['timestamp'] - df['timestamp'].iloc[0]).dt.total_seconds() / ((df['timestamp'].iloc[-1] - df['timestamp'].iloc[0]).total_seconds())) * 100
+df['progress_pct'] = df['progress_pct'].clip(0,100)
+
+# -------------------------
+# Playback controls
+# -------------------------
+st.sidebar.header("Playback")
+idx = st.sidebar.slider("Select row (time index)", 0, len(df)-1, len(df)-1, step=1)
+play = st.sidebar.button("Play")
+stop = st.sidebar.button("Stop")
+autoplay_interval = st.sidebar.slider("Animation interval (s)", 0.2, 2.0, 0.6, step=0.1)
+
+if 'playing' not in st.session_state:
+    st.session_state.playing = False
+
+if play:
+    st.session_state.playing = True
+if stop:
+    st.session_state.playing = False
+
+# If playing, run a simple loop updating idx (this blocks but is fine for small demos)
+if st.session_state.playing:
+    placeholder = st.empty()
+    start_idx = idx
+    try:
+        for i in range(start_idx, len(df)):
+            st.session_state.current_idx = i
+            # show UI once per frame
+            with placeholder.container():
+                # call the same UI refresh below by setting idx
+                st.experimental_rerun()
+            time.sleep(autoplay_interval)
+            if not st.session_state.playing:
+                break
+    except Exception:
+        st.session_state.playing = False
+
+# current index to show
+if 'current_idx' in st.session_state and st.session_state.playing:
+    idx = st.session_state.current_idx
+else:
+    # keep sidebar chosen idx unless playing set it
+    if 'current_idx' in st.session_state and not st.session_state.playing:
+        # keep last played index if user stopped
+        idx = st.session_state.current_idx
+
+row = df.loc[idx]
+
+# -------------------------
+# Layout: Map + Tilt visuals
+# -------------------------
+left, right = st.columns((2,1))
+
+with left:
+    st.subheader("Train map & timeline")
+    st.markdown(f"**Timestamp:** {row['timestamp']} — **Progress:** {row['progress_pct']:.2f}%")
+    # Map: route line + points + current marker
+    route_layer = pdk.Layer(
+        "PathLayer",
+        data=[{"path":[[lon,lat] for lat,lon in poly_coords], "name":"route"}],
+        get_path="path",
+        get_width=6,
+        width_min_pixels=2
+    )
+    points_pd = df[['latitude','longitude','timestamp','progress_pct']].copy()
+    points_pd['lon'] = points_pd['longitude']
+    points_pd['lat'] = points_pd['latitude']
+    points_layer = pdk.Layer(
+        "ScatterplotLayer",
+        data=points_pd.to_dict(orient='records'),
+        get_position='[lon, lat]',
+        get_radius=30,
+        radius_min_pixels=2,
+        pickable=False,
+    )
+    curr = {"lon": float(row['longitude']), "lat": float(row['latitude']), "name": "current"}
+    current_layer = pdk.Layer(
+        "ScatterplotLayer",
+        data=[curr],
+        get_position='[lon, lat]',
+        get_radius=80,
+        radius_min_pixels=6
+    )
+    midpoint = [float(df['longitude'].mean()), float(df['latitude'].mean())]
+    deck = pdk.Deck(
+        map_style='mapbox://styles/mapbox/light-v9',
+        initial_view_state=pdk.ViewState(latitude=midpoint[1], longitude=midpoint[0], zoom=8, pitch=20),
+        layers=[route_layer, points_layer, current_layer],
+    )
+    st.pydeck_chart(deck)
+
+    st.markdown("### Tilt over time (selected channels)")
+    # line charts for roll/pitch derived from tilt_x/y/z for each MPU
+    # compute roll/pitch for full df for plotting
+    for ch in range(4):
+        base = "" if ch == 0 else str(ch)
+        ax_col = f"tilt_x{base}"
+        ay_col = f"tilt_y{base}"
+        az_col = f"tilt_z{base}"
+        roll_list = []
+        pitch_list = []
+        for _, r in df[[ax_col, ay_col, az_col]].iterrows():
+            roll_val, pitch_val = compute_roll_pitch_from_acc(r[ax_col], r[ay_col], r[az_col])
+            roll_list.append(roll_val)
+            pitch_list.append(pitch_val)
+        tmp = pd.DataFrame({
+            "timestamp": df['timestamp'],
+            f"roll_ch{ch}": roll_list,
+            f"pitch_ch{ch}": pitch_list
+        }).set_index('timestamp')
+        st.markdown(f"**MPU {ch}**")
+        st.line_chart(tmp)
+
+with right:
+    st.subheader("Tilt (degrees) — per MPU")
+    st.caption("Roll = left↔right (°). Pitch = top↔bottom (°). Dot shows (roll, pitch). Circle = ±max tilt.")
+    mpu_groups = [
+        ("MPU0", ("tilt_x","tilt_y","tilt_z")),
+        ("MPU1", ("tilt_x1","tilt_y1","tilt_z1")),
+        ("MPU2", ("tilt_x2","tilt_y2","tilt_z2")),
+        ("MPU3", ("tilt_x3","tilt_y3","tilt_z3")),
+    ]
+    # metrics
+    metrics_cols = st.columns(2)
+    plots = []
+    for i, (title, (cx, cy, cz)) in enumerate(mpu_groups):
+        ax = float(row.get(cx, 0.0))
+        ay = float(row.get(cy, 0.0))
+        az = float(row.get(cz, 0.0))
+        roll_deg, pitch_deg = compute_roll_pitch_from_acc(ax, ay, az)
+        st.markdown(f"**{title}**")
+        st.metric("Roll (°) — left/right", f"{roll_deg}°")
+        st.metric("Pitch (°) — top/bottom", f"{pitch_deg}°")
+        st.caption(f"Raw accel (g): ax={ax:.3f}, ay={ay:.3f}, az={az:.3f}")
+        plots.append((title, roll_deg, pitch_deg))
+
+    st.markdown("#### Tilt indicators (visual)")
+    # 2x2 grid of tilt indicators
+    grid_cols = st.columns(2)
+    for i, (title, roll_deg, pitch_deg) in enumerate(plots):
+        col = grid_cols[i % 2]
+        with col:
+            fig, axp = plt.subplots(figsize=(3,3))
+            circle = plt.Circle((0,0), MAX_TILT_DISPLAY, fill=False, linewidth=1.2, alpha=0.7)
+            axp.add_patch(circle)
+            axp.axhline(0, linewidth=0.7, linestyle='--')
+            axp.axvline(0, linewidth=0.7, linestyle='--')
+            axp.scatter([roll_deg], [pitch_deg], s=120, zorder=5)
+            axp.set_xlim(-MAX_TILT_DISPLAY - 5, MAX_TILT_DISPLAY + 5)
+            axp.set_ylim(-MAX_TILT_DISPLAY - 5, MAX_TILT_DISPLAY + 5)
+            axp.set_xlabel("Roll (°)")
+            axp.set_ylabel("Pitch (°)")
+            axp.set_title(title)
+            axp.set_aspect('equal', 'box')
+            txt = f"({roll_deg}°, {pitch_deg}°)"
+            axp.text(0.02, 0.95, txt, transform=axp.transAxes, fontsize=9, verticalalignment='top')
+            # color dot red if magnitude > threshold
+            mag = math.sqrt(roll_deg**2 + pitch_deg**2)
+            if mag > MAX_TILT_DISPLAY:
+                # make red outline
+                axp.scatter([roll_deg], [pitch_deg], s=220, facecolors='none', edgecolors='red', linewidths=2, zorder=6)
+            st.pyplot(fig)
+            plt.close(fig)
+
+    # summary
+    avg_roll = round(sum(r for (_, r, _) in plots)/len(plots),2)
+    avg_pitch = round(sum(p for (_, _, p) in plots)/len(plots),2)
+    st.info(f"Average tilt across MPUs — Roll: {avg_roll}°, Pitch: {avg_pitch}°")
+    st.markdown("**Absolute tilt magnitude** (sqrt(roll² + pitch²)) per last sample:")
+    mags = [round(math.sqrt(r**2 + p**2), 2) for (_, r, p) in plots]
+    for i, m in enumerate(mags):
+        st.write(f"MPU{i}: {m}°")
+
+# -------------------------
+# Footer: data preview and download
+# -------------------------
 st.markdown("---")
-st.caption("Map is cached for a short time to prevent flashing. To force a fresh map, restart the app or change the CSV URL.")
+st.subheader("Data preview & export")
+st.dataframe(df.head(50))
+if st.button("Download filled CSV"):
+    csv = df.to_csv(index=False).encode('utf-8')
+    st.download_button("Click to download CSV", data=csv, file_name="mpu_filled_for_streamlit.csv", mime="text/csv")
+
+st.caption("Tip: If you run the simulator script (writes to 'mpu_simulated.csv'), enable 'Read local CSV' and click Play to animate the simulated trip.")
