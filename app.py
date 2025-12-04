@@ -1,283 +1,280 @@
 # app.py
-# Streamlit dashboard that reads a published Google Sheet CSV (no JSON),
-# refreshes telemetry every 2s, refreshes railway geometry every 5min,
-# shows map with railway geometry (Delhi->Jaipur fallback), interpolates marker
-# and displays cant/tilt/alerts. Simulator for GPS is optional (sidebar).
-
-import streamlit as st
-import pandas as pd
-import numpy as np
-import requests, math, itertools, time
+import time
 from datetime import datetime
-from typing import Tuple, List
-from streamlit_autorefresh import st_autorefresh
+import numpy as np
+import pandas as pd
+import streamlit as st
 from streamlit_folium import st_folium
 import folium
 
-# ------------- USER CONFIG -------------
-# Put your published CSV URL here (or set st.secrets["CSV_URL"])
-CSV_URL = st.secrets.get("CSV_URL", "")  # OR paste "https://docs.google.com/.../pub?gid=0&single=true&output=csv"
-READ_REFRESH_MS = 2000       # poll telemetry every 2s
-MAP_CACHE_SEC = 300          # refresh railway geometry every 5 minutes
-PERMITTED_CANT_MM = 165.0    # threshold, adjust if needed
-WARNING_RATIO = 0.8          # yellow threshold = 0.8 * permitted
-GAUGE_M = 1.676              # used if converting mm->deg (approx)
-OVERPASS_TIMEOUT = 15
+st.set_page_config(layout="wide", page_title="Rail Cant Monitor — CSV-backed (Live)")
 
-st.set_page_config(layout="wide", page_title="Rail Cant Monitor (CSV)", initial_sidebar_state="expanded")
-st.title("Rail Cant Monitor — CSV-backed (Live)")
+# ---------------------
+# CONFIG (edit if you want)
+# ---------------------
+CSV_URL_DEFAULT = ""  # default published CSV URL (leave blank and paste in sidebar)
+MAP_CACHE_TTL = 300  # seconds to cache the folium map (reduce flashing)
+CSV_CACHE_TTL = 600  # seconds to cache CSV loads
+TELEMETRY_POLL_SEC = 2  # seconds between telemetry updates (if you enable autorefresh)
+SIMULATE_GPS_DEFAULT = True  # simulate GPS if lat/lng are missing
 
-# small autorefresh for UI
-st_autorefresh(interval=READ_REFRESH_MS, limit=0, key="autorefresh")
+# Delhi & Jaipur coords (approx)
+DELHI = (28.6139, 77.2090)
+JAIPUR = (26.9124, 75.7873)
 
-# ------------ Sidebar controls ------------
-st.sidebar.header("Configuration")
-csv_url_input = st.sidebar.text_input("Published CSV URL (leave blank to use CSV_URL secret)", value=CSV_URL)
-if csv_url_input:
-    CSV_URL = csv_url_input
-
-st.sidebar.write("If your sheet doesn't have lat/lng, enable GPS simulation below.")
-simulate_gps = st.sidebar.checkbox("Simulate GPS along Delhi→Jaipur (if no lat/lng)", value=False)
-if simulate_gps:
-    st.sidebar.markdown("Start/end for simulated GPS (defaults to Delhi→Jaipur bounding coords)")
-    sim_start_lat = st.sidebar.number_input("Start lat", value=28.6517, format="%.6f")
-    sim_start_lng = st.sidebar.number_input("Start lon", value=77.2219, format="%.6f")
-    sim_end_lat = st.sidebar.number_input("End lat", value=26.9124, format="%.6f")
-    sim_end_lng = st.sidebar.number_input("End lon", value=75.7873, format="%.6f")
-
-st.sidebar.markdown("---")
-st.sidebar.markdown("Map refresh: cached every 5 minutes to avoid flashing")
-st.sidebar.markdown("Telemetry poll: every 2 seconds")
-
-# ------------- helpers -------------
-def safe_float(x, default=np.nan):
+# ---------------------
+# Helper functions
+# ---------------------
+@st.cache_data(ttl=CSV_CACHE_TTL)
+def load_csv(csv_url: str):
+    """Load CSV from URL (cached). Returns dataframe or raises."""
+    if not csv_url:
+        return None
     try:
-        if x is None: return default
-        return float(x)
-    except Exception:
-        return default
-
-def haversine_km(p1: Tuple[float,float], p2: Tuple[float,float]) -> float:
-    lat1, lon1 = p1; lat2, lon2 = p2
-    R = 6371.0
-    phi1 = math.radians(lat1); phi2 = math.radians(lat2)
-    dphi = math.radians(lat2-lat1); dlambda = math.radians(lon2-lon1)
-    a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlambda/2)**2
-    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
-
-@st.cache_data(ttl=MAP_CACHE_SEC)
-def fetch_osm_rail(lat_min: float, lon_min: float, lat_max: float, lon_max: float) -> List[List[Tuple[float,float]]]:
-    """
-    Query Overpass for railway ways inside bbox. Returns list of ways (list of (lat,lng)).
-    Cached for MAP_CACHE_SEC seconds to avoid reloading tiles.
-    """
-    bbox = f"{lat_min},{lon_min},{lat_max},{lon_max}"
-    q = f"""
-    [out:json][timeout:{OVERPASS_TIMEOUT}];
-    (
-      way["railway"~"rail|light_rail|railway"]({bbox});
-    );
-    out body;
-    >;
-    out skel qt;
-    """
-    try:
-        r = requests.post("https://overpass-api.de/api/interpreter", data=q.strip(), timeout=OVERPASS_TIMEOUT)
-        r.raise_for_status()
-        js = r.json()
-        nodes = {}
-        ways = []
-        for el in js.get("elements", []):
-            if el.get("type") == "node":
-                nodes[el["id"]] = (el["lat"], el["lon"])
-        for el in js.get("elements", []):
-            if el.get("type") == "way":
-                node_ids = el.get("nodes", [])
-                coords = [nodes[nid] for nid in node_ids if nid in nodes]
-                if len(coords) >= 2:
-                    ways.append(coords)
-        return ways
-    except Exception:
-        return []
-
-def load_csv_dataframe(url: str) -> pd.DataFrame:
-    """Load the published CSV into a pandas DataFrame; show friendly error if fails."""
-    try:
-        df = pd.read_csv(url)
+        df = pd.read_csv(csv_url)
+        # strip whitespace from columns
         df.columns = [c.strip() for c in df.columns]
         return df
     except Exception as e:
-        st.error("Failed to fetch CSV. Make sure you published the sheet to web (CSV) and pasted the correct URL.")
-        st.write("Error:", e)
-        st.stop()
+        # bubble up error to UI
+        raise RuntimeError(f"Error loading CSV: {e}")
 
-def safe_interp_between_rows(row0, row1, now_ts):
-    """Interpolate lat/lng between two rows based on their timestamps. Returns tuple (lat,lng)."""
-    try:
-        t0 = pd.to_datetime(row0["timestamp"], errors="coerce")
-        t1 = pd.to_datetime(row1["timestamp"], errors="coerce")
-        if pd.isna(t0) or pd.isna(t1) or t1 <= t0:
-            return safe_float(row1.get("lat")), safe_float(row1.get("lng"))
-        total = (t1 - t0).total_seconds()
-        frac = (now_ts - t0).total_seconds() / total
-        frac = max(0.0, min(1.0, frac))
-        lat = safe_float(row0.get("lat")) + (safe_float(row1.get("lat")) - safe_float(row0.get("lat"))) * frac
-        lng = safe_float(row0.get("lng")) + (safe_float(row1.get("lng")) - safe_float(row0.get("lng"))) * frac
-        return lat, lng
-    except Exception:
-        return safe_float(row1.get("lat")), safe_float(row1.get("lng"))
+def detect_timestamp_column(df: pd.DataFrame):
+    """Return the name of a timestamp-like column if found, else None."""
+    if df is None or df.empty:
+        return None
+    candidates = [c for c in df.columns if c.lower() in ("timestamp", "time", "ts", "datetime", "created", "date")]
+    if candidates:
+        return candidates[0]
+    # fallback: look for columns containing 'time' or 'date'
+    for c in df.columns:
+        if "time" in c.lower() or "date" in c.lower():
+            return c
+    return None
 
-# ------------- main -------------
-if not CSV_URL:
-    st.warning("Please paste your published CSV URL in the sidebar or set CSV_URL in st.secrets.")
-    st.stop()
+def ensure_timestamp(df: pd.DataFrame):
+    """
+    Ensure df has a usable timestamp column.
+    Returns (df, ts_col_name).
+    If no timestamp exists, creates a synthetic 'timestamp' column using monotonic recent times.
+    """
+    if df is None:
+        return df, None
 
-df = load_csv_dataframe(CSV_URL)
-if df.empty:
-    st.info("Spreadsheet has no rows yet.")
-    st.stop()
+    df = df.copy()
+    ts_col = detect_timestamp_column(df)
+    if ts_col:
+        # try to parse, coerce invalids to NaT
+        df[ts_col] = pd.to_datetime(df[ts_col], errors="coerce")
+        # if all values are NaT, treat as no timestamp
+        if df[ts_col].isna().all():
+            ts_col = None
+        else:
+            # sort by timestamp to make sure latest is last
+            df = df.sort_values(ts_col).reset_index(drop=True)
+            return df, ts_col
 
-# Normalize (we expect headers as confirmed)
-# Expected headers: timestamp, channel, acc_x, acc_y, acc_z, gyro_x, gyro_y, gyro_z, roll, pitch, [optional cant_mm, lat, lng, progress_km]
-cols = [c.lower() for c in df.columns]
-colmap = {c.lower(): c for c in df.columns}
+    # No usable timestamp found -> generate synthetic timestamps
+    n = len(df)
+    if n == 0:
+        return df, None
+    start = pd.Timestamp.now()
+    # create timestamps separated by 1 second (deterministic for a run)
+    synthetic_ts = [start + pd.Timedelta(seconds=i) for i in range(n)]
+    df["timestamp"] = synthetic_ts
+    df = df.reset_index(drop=True)
+    return df, "timestamp"
 
-# detect lat/lng columns if present
-has_lat = any("lat" == c or c.endswith("lat") for c in cols)
-has_lng = any("lng" == c or c.endswith("lng") for c in cols)
-lat_col = colmap.get("lat") if "lat" in colmap else (colmap.get("latitude") if "latitude" in colmap else None)
-lng_col = colmap.get("lng") if "lng" in colmap else (colmap.get("longitude") if "longitude" in colmap else None)
+def detect_cant_column(df: pd.DataFrame):
+    """Detect a column that likely holds the 'cant' telemetry value."""
+    if df is None or df.empty:
+        return None
+    # common names
+    for name in df.columns:
+        if name.lower() in ("cant", "cant_mm", "cant (mm)", "cant_mm "):
+            return name
+    # fuzzy: column name contains 'cant' or 'inclination' or 'value'
+    for name in df.columns:
+        if "cant" in name.lower() or "inclination" in name.lower() or "value" in name.lower():
+            return name
+    # fallback: return the last numeric column
+    numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+    if numeric_cols:
+        return numeric_cols[-1]
+    return None
 
-# detect cant column
-cant_col = None
-for candidate in ["cant_mm","cant","cant_mm "]:
-    if candidate in colmap:
-        cant_col = colmap[candidate]
-        break
+def simulate_gps_along(n_points, start=DELHI, end=JAIPUR):
+    """Return lat/lon arrays linearly interpolated between two points (inclusive)."""
+    if n_points <= 0:
+        return [], []
+    lats = np.linspace(start[0], end[0], n_points)
+    lons = np.linspace(start[1], end[1], n_points)
+    return lats, lons
 
-# compute latest position (interpolated)
-latest_row = df.iloc[-1].to_dict()
-prev_row = df.iloc[-2].to_dict() if len(df) >= 2 else None
-now_ts = pd.to_datetime(datetime.now())
+@st.cache_data(ttl=MAP_CACHE_TTL)
+def build_map(track_coords, center=None, zoom_start=7):
+    """
+    Build a folium.Map containing the track polyline and start/end markers.
+    This function is cached to reduce rebuilds and flashing.
+    """
+    if center is None:
+        center = track_coords[len(track_coords)//2] if track_coords else DELHI
+    m = folium.Map(location=center, zoom_start=zoom_start)
+    if track_coords and len(track_coords) > 0:
+        folium.PolyLine(track_coords, weight=4, opacity=0.8).add_to(m)
+        folium.CircleMarker(track_coords[0], radius=6, popup="start", tooltip="start").add_to(m)
+        folium.CircleMarker(track_coords[-1], radius=6, popup="end", tooltip="end").add_to(m)
+    return m
 
-if lat_col and lng_col:
-    # interpolate marker smoothly
-    if prev_row is not None and prev_row.get("timestamp") is not None:
-        lat_marker, lng_marker = safe_interp_between_rows(prev_row, latest_row, now_ts)
-    else:
-        lat_marker, lng_marker = safe_float(latest_row.get(lat_col)), safe_float(latest_row.get(lng_col))
-else:
-    # No lat/lng in sheet: optionally simulate simple straight-line GPS along Delhi->Jaipur if enabled
-    if simulate_gps:
-        # linear interpolate based on row index
-        n = len(df)
-        idx = len(df)-1
-        frac = idx / max(1, n-1)
-        lat_marker = sim_start_lat + (sim_end_lat - sim_start_lat) * frac
-        lng_marker = sim_start_lng + (sim_end_lng - sim_start_lng) * frac
-    else:
-        lat_marker = None; lng_marker = None
+# ---------------------
+# Sidebar: user inputs
+# ---------------------
+st.sidebar.header("Configuration")
+csv_url = st.sidebar.text_input("Published CSV URL (leave blank to use CSV_URL secret)", CSV_URL_DEFAULT)
+simulate_gps_checkbox = st.sidebar.checkbox("Simulate GPS along Delhi→Jaipur (if no lat/lng)", value=SIMULATE_GPS_DEFAULT)
+st.sidebar.markdown(f"Map refresh: cached every {MAP_CACHE_TTL//60} minutes to avoid flashing")
+st.sidebar.markdown(f"Telemetry poll: every {TELEMETRY_POLL_SEC} seconds")
 
-# compute progress (if progress_km column exists), else try compute from lat/lng
-progress_km = None
-if "progress_km" in colmap:
-    progress_km = safe_float(latest_row.get(colmap["progress_km"]))
-elif lat_marker is not None and lat_col and lng_col:
-    # compute rough progress along path: use first and last row as endpoints
-    start = (safe_float(df.iloc[0].get(lat_col)), safe_float(df.iloc[0].get(lng_col)))
-    end = (safe_float(df.iloc[-1].get(lat_col)), safe_float(df.iloc[-1].get(lng_col)))
-    total_km = haversine_km(start, end) if start and end else 0.0
-    done_km = haversine_km(start, (lat_marker, lng_marker))
-    progress_km = done_km
-else:
-    progress_km = None
+# Optional: autorefresh. Uncomment to enable automatic polls (the app will rerun periodically).
+# from streamlit_autorefresh import st_autorefresh
+# st_autorefresh(interval=TELEMETRY_POLL_SEC * 1000, key="auto_refresh")
 
-# cant reading: prefer sheet value if present, else simulate mild cant for display
+# ---------------------
+# Load CSV (cached)
+# ---------------------
+df = None
+load_error = None
+try:
+    df = load_csv(csv_url) if csv_url else None
+except Exception as e:
+    load_error = str(e)
+
+if load_error:
+    st.sidebar.error(load_error)
+
+# If no CSV, create empty df to avoid many checks later
+if df is None:
+    df = pd.DataFrame()
+
+# ---------------------
+# Normalize columns and ensure timestamp
+# ---------------------
+# Trim column names and remove pesky newlines
+df.columns = [c.strip() for c in df.columns]
+
+df, ts_col = ensure_timestamp(df)
+
+# ---------------------
+# Ensure cant column detection
+# ---------------------
+cant_col = detect_cant_column(df)
 if cant_col:
-    cant_val = safe_float(latest_row.get(cant_col))
+    # coerce to numeric if possible
+    df[cant_col] = pd.to_numeric(df[cant_col], errors="coerce")
+
+# ---------------------
+# Ensure lat/lng exist (simulate if missing)
+# ---------------------
+has_latlng = ("lat" in df.columns and "lng" in df.columns) or ("latitude" in df.columns and "longitude" in df.columns)
+# normalize names
+if "latitude" in df.columns and "longitude" in df.columns and not ("lat" in df.columns and "lng" in df.columns):
+    df = df.rename(columns={"latitude": "lat", "longitude": "lng"})
+
+if (not has_latlng) and simulate_gps_checkbox and len(df) > 0:
+    lats, lons = simulate_gps_along(len(df), start=DELHI, end=JAIPUR)
+    df = df.copy()
+    df["lat"] = lats
+    df["lng"] = lons
+
+# Build track coords if available
+if "lat" in df.columns and "lng" in df.columns and len(df) > 0:
+    coords = list(zip(df["lat"].astype(float).tolist(), df["lng"].astype(float).tolist()))
 else:
-    # simulate cant smoothly and use occasional spikes tied to row index
-    idx = len(df)-1
-    base = 30.0 + 10.0 * math.sin(idx/40.0)
-    # create deterministic spikes every few hundred rows for demonstration
-    spike = 0.0
-    if (idx % 350) in range(0, 25):
-        spike = 90.0 * math.exp(-((idx % 350)/10.0))
-    cant_val = base + spike
+    coords = []
 
-# status
-warn_thresh = WARNING_RATIO * PERMITTED_CANT_MM
-status = "GREEN"
-if not math.isnan(cant_val) and cant_val >= PERMITTED_CANT_MM:
-    status = "RED"
-elif not math.isnan(cant_val) and cant_val >= warn_thresh:
-    status = "YELLOW"
+# ---------------------
+# Layout: left = telemetry, middle = map, right = debug/data
+# ---------------------
+left_col, mid_col, right_col = st.columns([1.0, 2.0, 1.2])
 
-# ------------- Layout & Display -------------
-header_col, map_col = st.columns([1,2])
-with header_col:
-    st.subheader("Live telemetry")
-    st.write("Timestamp:", latest_row.get("timestamp", "<no timestamp>"))
-    st.write("Channel:", latest_row.get("channel", "—"))
-    # show IMU values if present
-    for key in ["acc_x","acc_y","acc_z","gyro_x","gyro_y","gyro_z","roll","pitch"]:
-        if key in colmap:
-            st.metric(key, latest_row.get(colmap[key]))
-    st.metric("Cant (mm)", f"{cant_val:.2f}")
-    st.markdown(f"**Status:** {'🟢' if status=='GREEN' else '🟡' if status=='YELLOW' else '🔴'} {status}")
+with left_col:
+    st.title("Live telemetry")
+    # placeholders so we only update these small widgets on rerun
+    ts_placeholder = st.empty()
+    channel_placeholder = st.empty()
+    val_placeholder = st.empty()
+    status_placeholder = st.empty()
+    st.markdown("---")
+    st.write(f"Telemetry poll: every {TELEMETRY_POLL_SEC} s (autorefresh disabled by default)")
 
-    if progress_km is not None:
-        st.progress(min(100.0, (progress_km / max(1.0, (df.shape[0] / 3600.0))) * 100.0))  # rough UI progress
+with mid_col:
+    st.title("Map")
+    map_placeholder = st.empty()
 
-with map_col:
-    st.subheader("Map")
-    if lat_marker is None or lng_marker is None:
-        st.info("No GPS in sheet. Enable 'Simulate GPS' in sidebar to see a map.")
+with right_col:
+    st.title("Raw / preview")
+    st.dataframe(df.tail(10), use_container_width=True)
+
+# ---------------------
+# Build & display cached map once per cache TTL
+# ---------------------
+folium_map = build_map(coords, center=coords[len(coords)//2] if coords else DELHI, zoom_start=7)
+# st_folium returns an object but writing it via placeholder avoids rebuilding map code block in layout
+map_placeholder.write(st_folium(folium_map, width="100%", height=480))
+
+# ---------------------
+# Telemetry display logic (lightweight)
+# ---------------------
+if len(df) > 0:
+    latest_row = df.iloc[-1]
+    # timestamp
+    if ts_col and ts_col in latest_row and pd.notna(latest_row[ts_col]):
+        ts_value = latest_row[ts_col]
+        # display as nice formatted string
+        if isinstance(ts_value, (pd.Timestamp, datetime)):
+            ts_str = pd.to_datetime(ts_value).strftime("%Y-%m-%d %H:%M:%S")
+        else:
+            ts_str = str(ts_value)
     else:
-        # build folium map and show OSM rail if available
-        m = folium.Map(location=(lat_marker, lng_marker), zoom_start=9, tiles="OpenStreetMap")
-        folium.Marker(location=(lat_marker, lng_marker), tooltip="Current pos").add_to(m)
+        ts_str = "—"
 
-        # compute bbox for Overpass
-        # find min/max from dataframe if lat/lng present
-        if lat_col and lng_col:
-            lats = df[lat_col].dropna().astype(float)
-            lngs = df[lng_col].dropna().astype(float)
-            lat_min, lat_max = float(lats.min()), float(lats.max())
-            lng_min, lng_max = float(lngs.min()), float(lngs.max())
+    # channel (if available)
+    channel_val = latest_row.get("channel", latest_row.get("Channel", "—"))
+
+    # telemetry value (cant)
+    latest_val = latest_row.get(cant_col, "—") if cant_col else "—"
+
+    ts_placeholder.markdown(f"**Timestamp:** {ts_str}")
+    channel_placeholder.markdown(f"**Channel:** {channel_val}")
+    val_placeholder.markdown(f"**Cant (mm)**\n\n### {latest_val}")
+    # status logic: example thresholds (customize)
+    try:
+        numeric_val = float(latest_val)
+        if np.isnan(numeric_val):
+            status = "NO DATA"
+            status_emoji = "⚪"
+        elif numeric_val < 50:
+            status = "GREEN"
+            status_emoji = "🟢"
+        elif numeric_val < 100:
+            status = "AMBER"
+            status_emoji = "🟠"
         else:
-            # use route bounds
-            lat_min, lat_max = min(sim_start_lat, sim_end_lat), max(sim_start_lat, sim_end_lat)
-            lng_min, lng_max = min(sim_start_lng, sim_end_lng), max(sim_start_lng, sim_end_lng)
+            status = "RED"
+            status_emoji = "🔴"
+    except Exception:
+        status = "UNKNOWN"
+        status_emoji = "⚪"
 
-        ways = fetch_osm_rail(lat_min-0.02, lng_min-0.02, lat_max+0.02, lng_max+0.02)
-
-        if not ways:
-            # fallback: plot recent GPS points if available
-            if lat_col and lng_col:
-                pts = list(zip(df[lat_col].astype(float), df[lng_col].astype(float)))
-                folium.PolyLine(pts, color="blue", weight=3).add_to(m)
-        else:
-            for way in ways:
-                folium.PolyLine(way, color="green", weight=2).add_to(m)
-
-        st_folium(m, width="100%", height=480)
-
-st.divider()
-st.subheader("History (latest rows)")
-show_cols = [c for c in df.columns if c.lower() in ("timestamp","channel","acc_x","acc_y","acc_z","gyro_x","gyro_y","gyro_z","roll","pitch","cant_mm","lat","lng","progress_km")]
-if not show_cols:
-    show_cols = df.columns.tolist()
-st.dataframe(df[show_cols].tail(200))
-
-# small chart for cant history if synthetic
-if "cant_mm" in colmap:
-    st.subheader("Cant history")
-    st.line_chart(df[colmap["cant_mm"]].tail(500).fillna(method="ffill"))
+    status_placeholder.markdown(f"**Status:** {status_emoji} {status}")
 else:
-    # create synthetic cant series for chart
-    synthetic = [30.0 + 10.0*math.sin(i/40.0) + (90.0*math.exp(-((i%350)/10.0)) if (i%350) < 25 else 0.0) for i in range(max(0, len(df)-500), len(df))]
-    st.subheader("Simulated cant history")
-    st.line_chart(pd.Series(synthetic).fillna(method="ffill"))
+    ts_placeholder.markdown("**Timestamp:** —")
+    channel_placeholder.markdown("**Channel:** —")
+    val_placeholder.markdown("**Cant (mm)**\n\n### —")
+    status_placeholder.markdown("**Status:** ⚪ NO DATA")
 
-st.caption("Map refresh cached every 5 minutes. Telemetry polled every 2 seconds. If your sheet lacks GPS, enable 'Simulate GPS' in the sidebar.")
+# ---------------------
+# Footer / tips
+# ---------------------
+st.markdown("---")
+st.caption("Map is cached for MAP_CACHE_TTL seconds to reduce flashing. To force a fresh map, restart the app or change the URL.")
