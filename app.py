@@ -10,7 +10,7 @@ from datetime import datetime
 
 # ---------- CONFIG ----------
 # Put your GET_URL into st.secrets["GET_URL"] (recommended) or paste it here:
-GET_URL = st.secrets.get("GET_URL", "PASTE_YOUR_GET_URL_HERE")
+GET_URL = st.secrets.get("GET_URL", "https://script.google.com/macros/s/AKfycbyve4vYVIIjH9UZHI1AgxPEbNgqmIHdDbemnv54RHM3dHMtsNTZUlCLb6E0S5dnKtk/exec")
 POLL_INTERVAL_MS = 1000
 PERMITTED_CANT_MM = 165.0   # default - change if you have a different requirement
 WARNING_RATIO = 0.8
