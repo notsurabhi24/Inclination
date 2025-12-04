@@ -6,3 +6,6 @@ plotly
 pydeck
 streamlit-autorefresh
 pytz
+streamlit-folium
+folium
+
