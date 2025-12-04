@@ -8,7 +8,7 @@ from streamlit_autorefresh import st_autorefresh
 from typing import Tuple
 
 # ---------- CONFIG ----------
-GET_URL = st.secrets.get("GET_URL", "PASTE_YOUR_GET_URL_HERE")  # <-- put your /exec URL here or set in .streamlit/secrets.toml
+GET_URL = st.secrets.get("GET_URL", "https://script.google.com/macros/s/AKfycbz-NRGeJRi-T7Jmf7mtjYqTOWvoZdqqHmYLIfVjD6IdydPmUbXkY52vOqpbHq3IV-zTSg/exec")  # <-- put your /exec URL here or set in .streamlit/secrets.toml
 READ_REFRESH_MS = 2000       # readings refresh
 MAP_REFRESH_SEC = 300        # if you keep caching functions, they can be added later
 PERMITTED_CANT_MM = 165.0
