@@ -15,7 +15,7 @@ st.set_page_config(layout="wide", page_title="MPU + Train Simulator — Tilt Vis
 # -------------------------
 # Config & route (edit here)
 # -------------------------
-CSV_FILENAME = "mpu_simulated.csv"  # local CSV the simulator writes (or upload your own)
+CSV_FILENAME = "https://docs.google.com/spreadsheets/d/1roswHtajRP9vBGBkswVZwQ8L6yQI72zWXRTLMgnFue8/edit?gid=0#gid=0"  # local CSV the simulator writes (or upload your own)
 ROUTE_STATIONS = [
     ("Mumbai CSMT", 18.939821, 72.835468),
     ("Dadar",       19.0180,    72.8481),
