@@ -1,163 +1,168 @@
-# app.py
+# app.py (revamped)
 import streamlit as st
-import requests
+import requests, math, time
 import pandas as pd
 import numpy as np
-import math
 import pydeck as pdk
 import plotly.graph_objects as go
 from streamlit_autorefresh import st_autorefresh
+from datetime import datetime
 
-# ---------------- CONFIG ----------------
-# If you want to keep the URL secret on Streamlit Cloud, set st.secrets["GET_URL"] instead.
-GET_URL = st.secrets.get("GET_URL", "https://script.google.com/macros/s/AKfycbxJPe3pekL1vPY8achwH39WbUWfldCKXsTRPmz-n30GdTzo7Dg1yj53DgrtzUchsEJ5/exec")
+# ---------- CONFIG ----------
+GET_URL = st.secrets.get("GET_URL", "https://script.google.com/u/0/home/projects/1VJzysk2zX_5PxNPQ4iHyFds3XZSeyVnTnRrep7Q6GLhEOmZ0NPbyMprD/edit")
+POLL_INTERVAL_MS = 1000
+PERMITTED_CANT_MM = 165.0   # RDSO/IR typical permit (mm)
+WARNING_RATIO = 0.8         # yellow when > 80% of permitted
+GAUGE_M = 1.676             # BG gauge in meters
+st.set_page_config(layout="wide", page_title="Rail Cant Monitor Revamp")
 
-POLL_INTERVAL_MS = 1000   # poll every 1s
-SMOOTH_WINDOW = 3         # smoothing window for animation
-MAX_HISTORY = 800         # keep this many rows for history charts
-# ----------------------------------------
-
-st.set_page_config(layout="wide", page_title="Rail Cant Monitor")
-st.title("Live Rail Cant & Gradient Monitor")
-
-# auto refresh (server-side)
+# Auto refresh
 st_autorefresh(interval=POLL_INTERVAL_MS, limit=0, key="autorefresh")
 
-@st.cache_data(ttl=2)
-def fetch_data():
+def mm_to_deg(mm, gauge_m=GAUGE_M):
+    return math.degrees(math.atan((mm/1000.0)/gauge_m))
+
+def fetch_rows():
     r = requests.get(GET_URL, timeout=8)
     r.raise_for_status()
     arr = r.json()
-    if not arr:
-        return pd.DataFrame()
-    df = pd.DataFrame(arr)
-    # normalize column names: strip whitespace
-    df.columns = [c.strip() for c in df.columns]
-    # coerce numeric fields we expect
-    for col in ["lat","lng","FL_z","FR_z","BR_z","BL_z","cant_deg","gradient_deg"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-    if "timestamp_ist" in df.columns:
-        df["timestamp_ist"] = pd.to_datetime(df["timestamp_ist"], errors="coerce")
-    return df
+    return pd.DataFrame(arr)
 
-df = fetch_data()
+def reverse_geocode(lat, lon):
+    # use Nominatim for demo; respect rate limits in production
+    try:
+        url = f"https://nominatim.openstreetmap.org/reverse?format=json&lat={lat}&lon={lon}&zoom=18&addressdetails=1"
+        headers = {"User-Agent":"RailCantMonitor/1.0 (email@example.com)"}
+        r = requests.get(url, headers=headers, timeout=6)
+        if r.status_code == 200:
+            js = r.json()
+            display = js.get("display_name") or js.get("name")
+            return display
+    except Exception:
+        return None
+    return None
 
-if df.empty:
-    st.warning("No telemetry yet — the sheet might be empty or GET_URL is incorrect.")
+# Load data
+try:
+    df = fetch_rows()
+except Exception as e:
+    st.error(f"Could not fetch telemetry: {e}")
     st.stop()
 
-# trim history
-df = df.tail(MAX_HISTORY).reset_index(drop=True)
+if df.empty:
+    st.info("No telemetry yet.")
+    st.stop()
+
+# Normalize & types
+df.columns = [c.strip() for c in df.columns]
+for c in ["lat","lng","cant_mm","grad_mm","cant_deg","grad_deg"]:
+    if c in df.columns:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+# Latest reading
 latest = df.iloc[-1]
+lat = latest.get("lat")
+lng = latest.get("lng")
+cant_mm = float(latest.get("cant_mm") or 0.0)
+grad_mm = float(latest.get("grad_mm") or 0.0)
+cant_deg = float(latest.get("cant_deg") or mm_to_deg(cant_mm))
+grad_deg = float(latest.get("grad_deg") or mm_to_deg(grad_mm))
 
-# smoothing helpers stored in session state
-if "sm_roll" not in st.session_state:
-    st.session_state.sm_roll = []
-if "sm_pitch" not in st.session_state:
-    st.session_state.sm_pitch = []
+# Progress: compute percent along path if start & end appear in sheet header or first/last points
+# We'll assume the path is from first row to last row in sheet (simulator uses A->B).
+start = (float(df.iloc[0].lat), float(df.iloc[0].lng))
+end   = (float(df.iloc[-1].lat), float(df.iloc[-1].lng)) if len(df)>1 else start
 
-def push_smooth(value, key, window=SMOOTH_WINDOW):
-    arr = getattr(st.session_state, key)
-    arr.append(float(value))
-    if len(arr) > window:
-        arr.pop(0)
-    setattr(st.session_state, key, arr)
-    return sum(arr) / max(1, len(arr))
+def haversine_km(p1,p2):
+    lat1,lon1 = p1; lat2,lon2 = p2
+    R = 6371.0
+    phi1 = math.radians(lat1); phi2 = math.radians(lat2)
+    dphi = math.radians(lat2-lat1); dlambda = math.radians(lon2-lon1)
+    a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlambda/2)**2
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
 
-# pick columns (allow flexible names)
-lat_col = "lat" if "lat" in df.columns else ( "latitude" if "latitude" in df.columns else None )
-lng_col = "lng" if "lng" in df.columns else ( "longitude" if "longitude" in df.columns else None )
-cant_col = "cant_deg" if "cant_deg" in df.columns else ("cant" if "cant" in df.columns else None)
-grad_col = "gradient_deg" if "gradient_deg" in df.columns else ("gradient" if "gradient" in df.columns else None)
+total_km = haversine_km(start, end)
+done_km = haversine_km(start, (lat, lng))
+pct_done = min(100.0, (done_km/total_km*100) if total_km>0 else 0.0)
 
-cur_cant = latest.get(cant_col, 0.0) if cant_col else 0.0
-cur_grad = latest.get(grad_col, 0.0) if grad_col else 0.0
+# Reverse geocode current position (cache short-term in session_state)
+if "last_loc" not in st.session_state or st.session_state.get("last_loc_coords") != (lat,lng):
+    st.session_state["last_loc_coords"] = (lat,lng)
+    st.session_state["last_loc_name"] = reverse_geocode(lat,lng)
 
-smooth_roll = push_smooth(cur_cant, "sm_roll")
-smooth_pitch = push_smooth(cur_grad, "sm_pitch")
+loc_name = st.session_state.get("last_loc_name") or f"{lat:.6f}, {lng:.6f}"
 
-# Layout: Map left, visual right
-col_map, col_vis = st.columns([2,1])
+# Threshold status
+warn_thresh_mm = WARNING_RATIO * PERMITTED_CANT_MM
+status = "GREEN"
+if cant_mm >= PERMITTED_CANT_MM:
+    status = "RED"
+elif cant_mm >= warn_thresh_mm:
+    status = "YELLOW"
 
-with col_map:
-    st.subheader("Map — latest position & path")
-    if lat_col and lng_col and not df[[lat_col,lng_col]].isnull().all().any():
-        latest_lat = float(latest[lat_col])
-        latest_lng = float(latest[lng_col])
-        # build path (lng, lat) pairs
-        path = [[float(r[lng_col]), float(r[lat_col])] for _, r in df[[lat_col,lng_col]].dropna().iterrows()]
-        deck = pdk.Deck(
-            initial_view_state=pdk.ViewState(latitude=latest_lat, longitude=latest_lng, zoom=17, pitch=35),
-            layers=[
-                pdk.Layer("ScatterplotLayer", data=[{"lat": latest_lat, "lng": latest_lng}], get_position='[lng, lat]', get_radius=10),
-                pdk.Layer("PathLayer", data=[{"path": path}], get_path="path", width_scale=20, width_min_pixels=2)
-            ],
-            map_style='light'
-        )
-        st.pydeck_chart(deck)
+def status_color(s):
+    return {"GREEN":"#2ECC71","YELLOW":"#F1C40F","RED":"#E74C3C"}[s]
+
+# UI layout
+c1,c2 = st.columns([2,1])
+with c1:
+    st.subheader("Map & Progress")
+    # map path: lat/lng history
+    path = [[float(r.lng), float(r.lat)] for _,r in df[['lat','lng']].dropna().iterrows()]
+    deck = pdk.Deck(
+        initial_view_state = pdk.ViewState(latitude=lat, longitude=lng, zoom=14, pitch=30),
+        layers = [
+            pdk.Layer("ScatterplotLayer", data=[{"lat":lat,"lng":lng}], get_position='[lng, lat]', get_radius=30),
+            pdk.Layer("PathLayer", data=[{"path":path}], get_path="path", width_scale=20, width_min_pixels=2)
+        ],
+        map_style='road'
+    )
+    st.pydeck_chart(deck)
+    st.write(f"Progress: **{pct_done:.2f}%** — {done_km:.3f} km of {total_km:.3f} km")
+    st.write(f"Current location: **{loc_name}**")
+
+with c2:
+    st.subheader("Live status")
+    st.metric("Cant (mm)", f"{cant_mm:.2f} mm", delta=None)
+    st.metric("Cant (deg)", f"{cant_deg:.3f}°", delta=None)
+    st.metric("Gradient (deg)", f"{grad_deg:.3f}°", delta=None)
+
+    # BIG status button
+    colb = st.empty()
+    color = status_color(status)
+    html = f"""
+    <div style='display:flex;align-items:center;gap:10px'>
+      <div style='width:20px;height:20px;background:{color};border-radius:4px'></div>
+      <div><b>Status:</b> {status}</div>
+    </div>
+    """
+    colb.markdown(html, unsafe_allow_html=True)
+
+    if status == "RED":
+        st.error("Threshold exceeded! Immediate check required.")
+    elif status == "YELLOW":
+        st.warning("Approaching allowed cant. Monitor closely.")
     else:
-        st.info("No valid GPS columns found (expected 'lat'/'lng').")
+        st.success("Within allowed cant limits.")
 
-with col_vis:
-    st.subheader("Live metrics")
-    st.metric("Cant (deg, left-right)", f"{smooth_roll:.2f}")
-    st.metric("Gradient (deg, front-back)", f"{smooth_pitch:.2f}")
-    st.write("Latest corner Z-values (g):")
-    corner_keys = [k for k in ["FL_z","FR_z","BR_z","BL_z"] if k in df.columns]
-    if corner_keys:
-        st.table(pd.DataFrame([latest[k] for k in corner_keys], index=corner_keys, columns=["g"]).T)
-    else:
-        st.write("Corner Z columns (FL_z,FR_z,BR_z,BL_z) not found in sheet.")
-
-# Animated 3D board
-st.subheader("3D board animation (cant = roll, gradient = pitch)")
-
-def make_board_mesh(pitch_deg, roll_deg, yaw_deg=0):
-    verts = [
-        (-1.5,-1,-0.05),(1.5,-1,-0.05),(1.5,1,-0.05),(-1.5,1,-0.05),
-        (-1.5,-1, 0.05),(1.5,-1,0.05),(1.5,1,0.05),(-1.5,1,0.05)
-    ]
-    faces = [(0,1,2,3),(4,5,6,7),(0,1,5,4),(2,3,7,6),(1,2,6,5),(0,3,7,4)]
-    rp = math.radians(pitch_deg); rr = math.radians(roll_deg); ry = math.radians(yaw_deg)
-    Rx = [[1,0,0],[0,math.cos(rp),-math.sin(rp)],[0,math.sin(rp),math.cos(rp)]]
-    Ry = [[math.cos(rr),0,math.sin(rr)],[0,1,0],[-math.sin(rr),0,math.cos(rr)]]
-    Rz = [[math.cos(ry),-math.sin(ry),0],[math.sin(ry),math.cos(ry),0],[0,0,1]]
-    def matmul(A,B):
-        return [[sum(A[i][m]*B[m][j] for m in range(3)) for j in range(3)] for i in range(3)]
-    R = matmul(Rz, matmul(Ry, Rx))
-    xr,yr,zr = [],[],[]
-    for x,y,z in verts:
-        xr.append(R[0][0]*x + R[0][1]*y + R[0][2]*z)
-        yr.append(R[1][0]*x + R[1][1]*y + R[1][2]*z)
-        zr.append(R[2][0]*x + R[2][1]*y + R[2][2]*z)
-    i,j,k = [],[],[]
-    for a,b,c,d in faces:
-        i += [a,a]; j += [b,c]; k += [c,d]
-    return xr,yr,zr,i,j,k
-
-xr,yr,zr,i,j,k = make_board_mesh(smooth_pitch, smooth_roll)
-fig = go.Figure(data=[go.Mesh3d(x=xr,y=yr,z=zr,i=i,j=j,k=k,opacity=0.6)])
-fig.update_layout(scene=dict(aspectmode='data', xaxis=dict(visible=False), yaxis=dict(visible=False), zaxis=dict(visible=False)),
-                  margin=dict(l=0,r=0,t=0,b=0), height=420)
+# historical charts
+st.subheader("History")
+df['timestamp_ist'] = pd.to_datetime(df['timestamp_ist'], errors='coerce')
+h = df.tail(500)
+fig = go.Figure()
+if 'cant_mm' in h.columns:
+    fig.add_trace(go.Scatter(x=h['timestamp_ist'], y=h['cant_mm'], name='Cant (mm)'))
+if 'grad_mm' in h.columns:
+    fig.add_trace(go.Scatter(x=h['timestamp_ist'], y=h['grad_mm'], name='Grad (mm)'))
+fig.update_layout(height=300, margin=dict(l=0,r=0,t=0,b=0))
 st.plotly_chart(fig, use_container_width=True)
 
-# History charts
-st.subheader("Recent history")
-time_col = "timestamp_ist" if "timestamp_ist" in df.columns else df.columns[0]
-hist = df[[time_col] + [c for c in ["cant_deg","gradient_deg"] if c in df.columns]].copy()
-hist[time_col] = pd.to_datetime(hist[time_col], errors="coerce")
-hist = hist.dropna(subset=[time_col]).tail(300)
+# recent table
+with st.expander("Recent rows"):
+    st.dataframe(h.tail(200))
 
-hist_fig = go.Figure()
-if "cant_deg" in hist.columns:
-    hist_fig.add_trace(go.Scatter(x=hist[time_col], y=hist["cant_deg"], name="Cant (deg)"))
-if "gradient_deg" in hist.columns:
-    hist_fig.add_trace(go.Scatter(x=hist[time_col], y=hist["gradient_deg"], name="Gradient (deg)"))
-hist_fig.update_layout(margin=dict(l=0,r=0,t=0,b=0), height=300)
-st.plotly_chart(hist_fig, use_container_width=True)
-
-with st.expander("Recent raw rows"):
-    st.dataframe(df.tail(200))
-
-st.caption("Data source: your Google Sheet (Apps Script doGet). Poll interval: 1s.")
+# admin: explain threshold values & source
+st.markdown("""
+**Threshold notes:**  
+We use `PERMITTED_CANT_MM = 165 mm` (typical RDSO/IR guidance) and flag **YELLOW** when > 80% of that value, **RED** when above permitted. These numbers are for demonstration and must be adapted to the exact route classification and official documentation. Sources: RDSO / Indian Railways track manuals.  
+""")
