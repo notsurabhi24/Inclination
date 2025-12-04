@@ -1,28 +1,26 @@
-# app_smooth_map_rails.py
-# Streamlit app: smooth real-time marker + railway geometry fetched every 5 minutes (cached)
+# app_fixed_final.py
 import streamlit as st
-import requests, math, time, itertools
+import requests, math, itertools, time
 import pandas as pd
-import numpy as np
 from datetime import datetime
 from streamlit_autorefresh import st_autorefresh
-from typing import List, Tuple
+from typing import Tuple
 
-# ---------- CONFIG ----------
-GET_URL = st.secrets.get("GET_URL", "https://script.google.com/u/0/home/projects/1RUiJczzFKyM1B_yh7hQoXxp3Jn5AHR7F4RV8m_yUH7GI5Q6fB3L2ti5f/edit")   # <-- put your /exec URL here or set in st.secrets
-READ_REFRESH_MS = 2000    # refresh readings every 2 seconds
-MAP_REFRESH_SEC = 300     # fetch railway geometry every 5 minutes (300s)
+# ------- CONFIG -------
+GET_URL = st.secrets.get("GET_URL", "https://script.google.com/macros/s/AKfycbz-NRGeJRi-T7Jmf7mtjYqTOWvoZdqqHmYLIfVjD6IdydPmUbXkY52vOqpbHq3IV-zTSg/exec")  # <-- put your /exec URL here or set in .streamlit/secrets.toml
+READ_REFRESH_MS = 2000          # refresh readings every 2 seconds
+MAP_REFRESH_SEC = 300           # refresh heavy railway geometry every 5 minutes
 PERMITTED_CANT_MM = 165.0
 WARNING_RATIO = 0.8
 GAUGE_M = 1.676
 
-st.set_page_config(layout="wide", page_title="Rail Cant Monitor — Rails + Smooth Marker")
-st.title("Rail Cant Monitor — Smooth marker + Railway tracks (map refresh every 5 min)")
+st.set_page_config(layout="wide", page_title="Rail Cant Monitor (fixed)", initial_sidebar_state="collapsed")
+st.title("Rail Cant Monitor — Stable UI (map refresh cached)")
 
-# auto refresh loop (this causes the script to re-run every READ_REFRESH_MS)
+# lightweight auto refresh
 st_autorefresh(interval=READ_REFRESH_MS, limit=0, key="autorefresh")
 
-# ---------- utility functions ----------
+# ---------- helpers ----------
 def haversine_km(p1: Tuple[float,float], p2: Tuple[float,float]) -> float:
     lat1,lon1 = p1; lat2,lon2 = p2
     R = 6371.0
@@ -32,15 +30,13 @@ def haversine_km(p1: Tuple[float,float], p2: Tuple[float,float]) -> float:
     return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
 
 @st.cache_data(ttl=MAP_REFRESH_SEC)
-def fetch_railway_geo(lat_min: float, lon_min: float, lat_max: float, lon_max: float):
+def fetch_railway_geo_cached(lat_min, lon_min, lat_max, lon_max):
     """
-    Fetch railway ways from Overpass API inside bbox.
-    Returns list of polylines (list of (lat,lng)).
-    Cached for MAP_REFRESH_SEC seconds to avoid re-fetching repeatedly.
+    Query Overpass for railway ways inside bbox. Cached for MAP_REFRESH_SEC seconds.
+    Returns list of polylines (list of (lat,lng)) or None on failure.
     """
     bbox = f"{lat_min},{lon_min},{lat_max},{lon_max}"
-    # Overpass QL: fetch ways with railway tag within bbox, include node coordinates
-    query = f"""
+    q = f"""
     [out:json][timeout:25];
     (
       way["railway"~"rail|light_rail|railway"]({bbox});
@@ -49,43 +45,54 @@ def fetch_railway_geo(lat_min: float, lon_min: float, lat_max: float, lon_max: f
     >;
     out skel qt;
     """
-    url = "https://overpass-api.de/api/interpreter"
     try:
-        r = requests.post(url, data=query.strip(), timeout=30)
+        r = requests.post("https://overpass-api.de/api/interpreter", data=q.strip(), timeout=25)
         r.raise_for_status()
         js = r.json()
-        # parse nodes
         nodes = {}
         ways = []
         for el in js.get("elements", []):
             if el.get("type") == "node":
                 nodes[el["id"]] = (el["lat"], el["lon"])
-        # extract ways (sequence of node ids -> coordinates)
         for el in js.get("elements", []):
             if el.get("type") == "way":
                 node_ids = el.get("nodes", [])
                 coords = [nodes[nid] for nid in node_ids if nid in nodes]
                 if len(coords) >= 2:
                     ways.append(coords)
-        # return ways as list of lists of (lat,lng)
-        if len(ways) == 0:
-            return None
-        return ways
-    except Exception as e:
-        # network error / rate-limited -> return None (caller will fallback)
+        return ways if ways else None
+    except Exception:
         return None
 
-def fetch_rows(get_url: str) -> pd.DataFrame:
-    r = requests.get(get_url, timeout=10)
-    r.raise_for_status()
-    arr = r.json()
+def fetch_rows_safe(get_url: str) -> pd.DataFrame:
+    """Fetch telemetry JSON safely; on non-JSON show raw response in the app and stop."""
+    try:
+        r = requests.get(get_url, timeout=12)
+    except Exception as e:
+        st.error("Network error when contacting GET_URL: " + str(e))
+        st.stop()
+    ct = r.headers.get("content-type","")
+    if 'application/json' not in ct.lower():
+        st.error(f"GET_URL returned non-JSON (status {r.status_code}, content-type: {ct})")
+        st.markdown("**Server response (first 2000 chars):**")
+        st.code(r.text[:2000])
+        st.stop()
+    try:
+        arr = r.json()
+    except Exception as e:
+        st.error("Failed to parse JSON from GET_URL: " + str(e))
+        st.markdown("**Server raw response (first 2000 chars):**")
+        st.code(r.text[:2000])
+        st.stop()
+    if not isinstance(arr, list):
+        st.error("GET_URL returned JSON but not an array. Showing raw JSON (first 2000 chars).")
+        st.code(str(arr)[:2000])
+        st.stop()
     return pd.DataFrame(arr)
 
-def compute_interp_pos(past_row, now_row, current_time: datetime):
-    # past_row/now_row are pandas Series with timestamp_ist, lat, lng
+def interp_pos(past_row, now_row, current_time: datetime) -> Tuple[float,float]:
     try:
-        t0 = pd.to_datetime(past_row["timestamp_ist"])
-        t1 = pd.to_datetime(now_row["timestamp_ist"])
+        t0 = pd.to_datetime(past_row["timestamp_ist"]); t1 = pd.to_datetime(now_row["timestamp_ist"])
     except Exception:
         return float(now_row["lat"]), float(now_row["lng"])
     if t1 <= t0:
@@ -96,106 +103,93 @@ def compute_interp_pos(past_row, now_row, current_time: datetime):
     lng = float(past_row["lng"]) + (float(now_row["lng"]) - float(past_row["lng"])) * frac
     return lat, lng
 
-# ---------- main ----------
-# 1) load telemetry rows
-try:
-    df = fetch_rows(GET_URL)
-except Exception as e:
-    st.error("Could not fetch telemetry from your Google Sheet. Check GET_URL and Apps Script deployment.")
-    st.write("Error:", e)
-    st.stop()
+# ---------- main (use small containers to reduce perceived flash) ----------
+# Containers (preserve layout between reruns)
+header_col, map_col = st.columns([1,3])
+with header_col:
+    last_update_placeholder = st.empty()
+    status_placeholder = st.empty()
 
+map_container = st.container()
+left_col, right_col = st.columns([3,1])
+
+# 1) fetch telemetry
+df = fetch_rows_safe(GET_URL)
 if df.empty or len(df) < 2:
-    st.info("Waiting for telemetry (need at least 2 rows).")
+    st.info("Waiting for telemetry (need >=2 rows).")
     st.stop()
 
-# normalize column names and types
+# normalize
 df.columns = [c.strip() for c in df.columns]
 for c in ["lat","lng","cant_mm","grad_mm","cant_deg","grad_deg"]:
-    if c in df.columns:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
+    if c in df.columns: df[c] = pd.to_numeric(df[c], errors="coerce")
 if "timestamp_ist" in df.columns:
     df["timestamp_ist"] = pd.to_datetime(df["timestamp_ist"], errors="coerce")
 
-# compute route bounding box from telemetry (expand slightly)
+# compute bbox and fetch cached railway geometry (every MAP_REFRESH_SEC seconds)
 lat_min = float(df["lat"].min()); lat_max = float(df["lat"].max())
 lng_min = float(df["lng"].min()); lng_max = float(df["lng"].max())
-pad_lat = max(0.01, (lat_max - lat_min) * 0.2 + 0.005)   # ensure small bbox if points are close
+pad_lat = max(0.01, (lat_max - lat_min) * 0.2 + 0.005)
 pad_lng = max(0.01, (lng_max - lng_min) * 0.2 + 0.005)
 lat_min_q, lat_max_q = lat_min - pad_lat, lat_max + pad_lat
 lng_min_q, lng_max_q = lng_min - pad_lng, lng_max + pad_lng
 
-# 2) fetch railway geometry (cached for MAP_REFRESH_SEC)
-railways = fetch_railway_geo(lat_min_q, lng_min_q, lat_max_q, lng_max_q)
-
-# If Overpass returned nothing, fallback to drawing the logged path as the "track"
+railways = fetch_railway_geo_cached(lat_min_q, lng_min_q, lat_max_q, lng_max_q)
 if not railways:
-    # build single polyline from telemetry path
     path_coords = [(float(r["lat"]), float(r["lng"])) for _, r in df[["lat","lng"]].dropna().iterrows()]
     railways = [path_coords]
 
-# 3) prepare interpolated marker between last two rows for smooth motion
-past = df.iloc[-2]
-now = df.iloc[-1]
+# compute smooth marker pos
+past = df.iloc[-2]; now = df.iloc[-1]
 current_time = pd.to_datetime(datetime.now())
-interp_lat, interp_lng = compute_interp_pos(past, now, current_time)
+interp_lat, interp_lng = interp_pos(past, now, current_time)
 
-# 4) progress calculation (based on logged route start->end)
+# progress
 start = (float(df.iloc[0]["lat"]), float(df.iloc[0]["lng"]))
 end = (float(df.iloc[-1]["lat"]), float(df.iloc[-1]["lng"]))
 total_km = haversine_km(start, end)
 done_km = haversine_km(start, (interp_lat, interp_lng))
 pct_done = min(100.0, (done_km / total_km * 100.0) if total_km > 0 else 0.0)
 
-# 5) threshold status
+# status
 cant_mm = float(now.get("cant_mm") or 0.0)
 warn_thresh = WARNING_RATIO * PERMITTED_CANT_MM
 status = "GREEN"
-if cant_mm >= PERMITTED_CANT_MM:
-    status = "RED"
-elif cant_mm >= warn_thresh:
-    status = "YELLOW"
+if cant_mm >= PERMITTED_CANT_MM: status = "RED"
+elif cant_mm >= warn_thresh: status = "YELLOW"
 color_map = {"GREEN":"#2ECC71","YELLOW":"#F1C40F","RED":"#E74C3C"}
 
-# ---------- UI layout ----------
-col_map, col_live = st.columns([2,1])
+# Update small header containers (fast)
+last_update_placeholder.markdown(f"**Last poll:** {current_time.strftime('%Y-%m-%d %H:%M:%S')}")
+status_placeholder.markdown(f"<div style='display:flex;gap:8px;align-items:center'><div style='width:12px;height:12px;background:{color_map[status]};border-radius:4px'></div><div><b>Status:</b> {status}</div></div>", unsafe_allow_html=True)
 
-with col_map:
-    st.subheader("Map — railway track (refreshed every 5 minutes) + smooth position")
-    # prepare map dataframe for st.map: telemetry path + current smooth point
-    map_path_df = pd.DataFrame([{"latitude": lat, "longitude": lng} for lat, lng in list(itertools.chain.from_iterable(railways))])
-    # drop duplicates (st.map will plot points; path effect is visible by many points)
-    map_path_df = map_path_df.drop_duplicates().tail(5000)  # limit to 5k points to keep UI responsive
-
-    # Show track (as points) using st.map - stable and lightweight
-    st.map(map_path_df)
-
-    # show smooth marker coordinates and percent
+# Map + path (in container to avoid full-layout flicker)
+with map_container:
+    st.subheader("Map (rail track is cached, re-fetched every 5 min)")
+    # st.map expects DataFrame with 'latitude' & 'longitude'
+    pts = list(itertools.chain.from_iterable(railways))
+    map_df = pd.DataFrame([{"latitude": lat, "longitude": lng} for lat, lng in pts]).drop_duplicates().tail(5000)
+    # draw path points (stable rendering)
+    st.map(map_df)
     st.markdown(f"**Smooth marker:** {interp_lat:.6f}, {interp_lng:.6f}")
     st.write(f"Progress: **{pct_done:.2f}%** — {done_km:.3f} km of {total_km:.3f} km")
 
-    # small legend + sample last N path points table
-    with st.expander("Show sampled railway polyline preview (first 200 points)"):
-        st.dataframe(map_path_df.head(200))
-
-with col_live:
-    st.subheader("Live readings & status")
+# Right column (metrics) updated rapidly
+with right_col:
+    st.subheader("Live readings")
     st.metric("Cant (mm)", f"{cant_mm:.2f}")
     st.metric("Cant (deg)", f"{(math.degrees(math.atan((cant_mm/1000.0)/GAUGE_M))):.3f}°")
     st.metric("Gradient (deg)", f"{(math.degrees(math.atan((float(now.get('grad_mm') or 0.0)/1000.0)/GAUGE_M))):.3f}°")
-    st.markdown(f"<div style='display:flex;gap:12px;align-items:center'><div style='width:18px;height:18px;background:{color_map[status]};border-radius:6px'></div><div><b>Status:</b> {status}</div></div>", unsafe_allow_html=True)
     if status == "RED":
-        st.error("Threshold exceeded — immediate attention advised.")
+        st.error("Threshold exceeded — immediate attention.")
     elif status == "YELLOW":
-        st.warning("Approaching threshold — monitor closely.")
+        st.warning("Approaching threshold.")
     else:
-        st.success("Within allowed cant limits.")
+        st.success("Within allowed limits.")
 
-# History and recent rows (bottom)
-st.subheader("History & recent rows")
+# history (bottom)
+st.subheader("History (latest)")
 h = df.tail(1000)
 st.line_chart(h[["cant_mm","grad_mm"]].fillna(method="ffill"))
-with st.expander("Recent raw rows (latest 200)"):
+with st.expander("Recent rows"):
     st.dataframe(h.tail(200))
-
-st.caption("Railway geometry comes from OpenStreetMap (Overpass API) and is cached for 5 minutes to prevent repeated fetching / UI flashing. If Overpass fails, the logged telemetry path is used as a fallback.")
