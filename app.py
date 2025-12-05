@@ -1,9 +1,3 @@
-# app.py
-# Streamlit dashboard (GPS removed).
-# Reads sheet/GitHub CSV link, expects headers:
-# Timestamp,TiltX_0,TiltY_0,TiltZ_0,TiltX_1,TiltY_1,TiltZ_1,TiltX_2,TiltY_2,TiltZ_2,TiltX_3,TiltY_3,TiltZ_3,Latitude,Longitude
-# -- but Latitude/Longitude are ignored. Focus: show mean roll/pitch, cant_mm, left-right diff_mm, timestamp from sheet.
-
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -13,7 +7,7 @@ from typing import Tuple
 from streamlit_autorefresh import st_autorefresh
 from urllib.parse import urlparse, parse_qs
 
-# ---------- CONFIG ----------
+
 READ_REFRESH_MS = 2000       # UI poll interval (2s)
 GAUGE_M = 1.676              # meters (Indian broad gauge)
 PERMITTED_CANT_MM = 165.0
@@ -290,4 +284,3 @@ buf = io.StringIO()
 df.to_csv(buf, index=False)
 st.download_button("Download augmented CSV", data=buf.getvalue(), file_name="augmented_telemetry_no_gps.csv", mime="text/csv")
 
-st.caption("Notes: GPS/map removed. Timestamp displayed exactly from your sheet. If the metrics show — then values are missing or non-numeric in the sheet; check that TiltX/TiltY columns contain numeric degree values.")
