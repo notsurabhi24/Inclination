@@ -212,19 +212,7 @@ with left_col:
     st.subheader("Charts (recent)")
     # show last N rows
     N = 200
-    chart_cols = []
-    try:
-        chart_df = df[[col("tiltx_0"), col("tiltx_1"), col("tiltx_2"), col("tiltx_3")]].tail(N).astype(float)
-        st.line_chart(chart_df)
-    except Exception:
-        st.info("Unable to plot TiltX chart (check numeric values).")
-
-    try:
-        chart_df2 = df[[col("tilty_0"), col("tilty_1"), col("tilty_2"), col("tilty_3")]].tail(N).astype(float)
-        st.line_chart(chart_df2)
-    except Exception:
-        st.info("Unable to plot TiltY chart (check numeric values).")
-
+    # Removed TiltX and TiltY charts per request — only show cant/left-right chart
     try:
         chart_df3 = df[["cant_mm","left_right_diff_mm"]].tail(N).astype(float)
         st.line_chart(chart_df3)
@@ -250,17 +238,36 @@ with right_col:
     show_metric("Right mean roll (deg)", latest.get("right_mean_roll_deg"), "deg")
     show_metric("Left-right diff (mm)", latest.get("left_right_diff_mm"), "mm")
 
-    # status color
+    # status color & threshold display (project-specific)
     cant_val = safe_float(latest.get("cant_mm"), np.nan)
+    limit = PERMITTED_CANT_MM
+    warn = WARNING_RATIO * PERMITTED_CANT_MM
+
+    st.markdown("**Thresholds:**")
+    st.markdown(f"- Permitted cant (limit): **{limit:.1f} mm**")
+    st.markdown(f"- Warning threshold (0.8 × limit): **{warn:.1f} mm**")
+
+    # Visual colored status box using safe HTML
     if np.isnan(cant_val):
         st.markdown("**Status:** ⚪ No cant value")
     else:
-        if cant_val >= PERMITTED_CANT_MM:
-            st.markdown("**Status:** 🔴 OVER LIMIT")
-        elif cant_val >= WARNING_RATIO * PERMITTED_CANT_MM:
-            st.markdown("**Status:** 🟡 Approaching limit")
+        if cant_val >= limit:
+            color = "#D9534F"  # red
+            status_text = "OVER LIMIT"
+        elif cant_val >= warn:
+            color = "#F0AD4E"  # yellow/orange
+            status_text = "Approaching limit"
         else:
-            st.markdown("**Status:** 🟢 OK")
+            color = "#5CB85C"  # green
+            status_text = "OK"
+
+        box_html = f"""
+        <div style="background-color:{color};padding:12px;border-radius:6px">
+            <strong style="color:white">Status: {status_text}</strong><br/>
+            <span style="color:white">Cant = {cant_val:.2f} mm</span>
+        </div>
+        """
+        st.markdown(box_html, unsafe_allow_html=True)
 
 # ---------- table of recent rows ----------
 st.subheader("Recent telemetry (tail)")
